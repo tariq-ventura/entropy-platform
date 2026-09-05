@@ -1,0 +1,89 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: entropy-postgres
+
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app_local_password
+      POSTGRES_DB: postgres
+
+    ports:
+      - "5432:5432"
+
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/01-databases.sql:ro
+
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U app -d postgres
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  fleet-service:
+    build:
+      context: ./fleet-service
+      dockerfile: Dockerfile
+
+    container_name: fleet-service
+
+    environment:
+      PORT: "3000"
+      DB_CONTEXT: postgresql
+      SERVICE_NAME: fleet-service
+      TRACE_TYPE: NONE
+      FLEET_SERVICE_URL: http://fleet-service:3000
+      DB_STRING: >-
+        host=postgres
+        user=app
+        password=app_local_password
+        dbname=fleet_db
+        port=5432
+        sslmode=disable
+        TimeZone=UTC
+
+    ports:
+      - "3000:3000"
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  logistic-service:
+    build:
+      context: ./logistic-service
+      dockerfile: Dockerfile
+
+    container_name: logistic-service
+
+    environment:
+      PORT: "3001"
+      DB_CONTEXT: postgresql
+      SERVICE_NAME: logistic-service
+      TRACE_TYPE: NONE
+      DB_STRING: >-
+        host=postgres
+        user=app
+        password=app_local_password
+        dbname=logistics_db
+        port=5432
+        sslmode=disable
+        TimeZone=UTC
+
+      FLEET_SERVICE_URL: >-
+        http://fleet-service:3000
+
+    ports:
+      - "3001:3001"
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      fleet-service:
+        condition: service_started
+
+volumes:
+  postgres_data:

@@ -1,0 +1,2 @@
+CREATE DATABASE fleet_db OWNER app;
+CREATE DATABASE logistics_db OWNER app;
