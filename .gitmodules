@@ -1,0 +1,6 @@
+[submodule "fleet-service"]
+	path = fleet-service
+	url = https://github.com/tariq-ventura/fleet-service.git
+[submodule "logistic-service"]
+	path = logistic-service
+	url = https://github.com/tariq-ventura/logistic-service.git
