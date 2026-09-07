@@ -2,19 +2,15 @@ services:
   postgres:
     image: postgres:17-alpine
     container_name: entropy-postgres
-
     environment:
       POSTGRES_USER: app
       POSTGRES_PASSWORD: app_local_password
       POSTGRES_DB: postgres
-
     ports:
       - "5432:5432"
-
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./postgres/init.sql:/docker-entrypoint-initdb.d/01-databases.sql:ro
-
     healthcheck:
       test:
         - CMD-SHELL
@@ -27,9 +23,7 @@ services:
     build:
       context: ./fleet-service
       dockerfile: Dockerfile
-
     container_name: fleet-service
-
     environment:
       PORT: "3000"
       DB_CONTEXT: postgresql
@@ -44,10 +38,8 @@ services:
         port=5432
         sslmode=disable
         TimeZone=UTC
-
     ports:
       - "3000:3000"
-
     depends_on:
       postgres:
         condition: service_healthy
@@ -56,9 +48,7 @@ services:
     build:
       context: ./logistic-service
       dockerfile: Dockerfile
-
     container_name: logistic-service
-
     environment:
       PORT: "3001"
       DB_CONTEXT: postgresql
@@ -75,15 +65,47 @@ services:
 
       FLEET_SERVICE_URL: >-
         http://fleet-service:3000
-
     ports:
       - "3001:3001"
-
     depends_on:
       postgres:
         condition: service_healthy
       fleet-service:
         condition: service_started
+    restart: unless-stopped
+
+  entropy-mcp-server:
+    container_name: entropy-mcp-server
+    build:
+      context: ./entropy-mcp-server
+      dockerfile: Dockerfile
+    environment:
+      PORT: "3002"
+      LOGISTIC_SERVICE_URL: "http://logistic-service:3001"
+      MCP_API_KEY: "${MCP_API_KEY:-entropy-local-secret}"
+    ports:
+      - "3002:3002"
+    depends_on:
+      logistic-service:
+        condition: service_started
+    restart: unless-stopped
+
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: n8n
+    ports:
+      - "5678:5678"
+    environment:
+      GENERIC_TIMEZONE: "America/El_Salvador"
+      TZ: "America/El_Salvador"
+      N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS: "true"
+      N8N_RUNNERS_ENABLED: "true"
+    volumes:
+      - n8n_data:/home/node/.n8n
+    depends_on:
+      - entropy-mcp-server
+    restart: unless-stopped
 
 volumes:
   postgres_data:
+  n8n_data:
