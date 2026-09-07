@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Prueba end-to-end de fleet-service + logistic-service.
+# Prueba end-to-end de fleet-service + logistic-service + entropy-mcp-server.
 #
 # Requisitos:
 #   - curl
 #   - jq
 #   - fleet-service ejecutándose
 #   - logistic-service ejecutándose y configurado para consultar fleet-service
+#   - entropy-mcp-server ejecutándose y configurado para consultar logistic-service
 #
 # Uso local:
 #   chmod +x fleet-logistic-e2e-test.sh
@@ -16,10 +17,18 @@ set -euo pipefail
 # URLs personalizadas:
 #   FLEET_BASE_URL=http://localhost:3000/api/v1 \
 #   LOGISTIC_BASE_URL=http://localhost:3001/api/v1 \
+#   MCP_BASE_URL=http://localhost:3002 \
+#   MCP_API_KEY=entropy-local-secret \
 #   ./fleet-logistic-e2e-test.sh
 
 FLEET_BASE_URL="${FLEET_BASE_URL:-http://localhost:3000/api/v1}"
 LOGISTIC_BASE_URL="${LOGISTIC_BASE_URL:-http://localhost:3001/api/v1}"
+MCP_BASE_URL="${MCP_BASE_URL:-http://localhost:3002}"
+MCP_ENDPOINT="${MCP_BASE_URL%/}/mcp"
+MCP_API_KEY="${MCP_API_KEY:-entropy-local-secret}"
+MCP_PROTOCOL_VERSION="${MCP_PROTOCOL_VERSION:-2026-07-28}"
+CURL_CONNECT_TIMEOUT="${CURL_CONNECT_TIMEOUT:-5}"
+CURL_MAX_TIME="${CURL_MAX_TIME:-30}"
 RUN_ID="${RUN_ID:-$(date +%s)}"
 BODY_FILE="$(mktemp)"
 
@@ -28,6 +37,9 @@ FLEET_ID=""
 NEAR_EQUIPMENT_ID=""
 FAR_EQUIPMENT_ID=""
 REQUEST_ID=""
+SECOND_REQUEST_ID=""
+ASSIGNMENT_ID=""
+CANCEL_ASSIGNMENT_ID=""
 
 cleanup() {
   rm -f "${BODY_FILE}"
@@ -86,6 +98,8 @@ call_api() {
 
   if [[ -n "${payload}" ]]; then
     HTTP_STATUS="$(curl --silent --show-error \
+      --connect-timeout "${CURL_CONNECT_TIMEOUT}" \
+      --max-time "${CURL_MAX_TIME}" \
       --output "${BODY_FILE}" \
       --write-out '%{http_code}' \
       --request "${method}" \
@@ -94,6 +108,8 @@ call_api() {
       "${base_url}${path}")"
   else
     HTTP_STATUS="$(curl --silent --show-error \
+      --connect-timeout "${CURL_CONNECT_TIMEOUT}" \
+      --max-time "${CURL_MAX_TIME}" \
       --output "${BODY_FILE}" \
       --write-out '%{http_code}' \
       --request "${method}" \
@@ -107,6 +123,187 @@ call_api() {
     echo "Se esperaba uno de estos códigos: ${expected_codes}" >&2
     exit 1
   fi
+}
+
+call_http() {
+  local label="$1"
+  local method="$2"
+  local url="$3"
+  local expected_codes="$4"
+
+  echo
+  echo "[${label}] ${method} ${url}"
+
+  HTTP_STATUS="$(curl --silent --show-error \
+    --connect-timeout "${CURL_CONNECT_TIMEOUT}" \
+    --max-time "${CURL_MAX_TIME}" \
+    --output "${BODY_FILE}" \
+    --write-out '%{http_code}' \
+    --request "${method}" \
+    "${url}")"
+
+  echo "HTTP ${HTTP_STATUS}"
+  print_body
+
+  if [[ " ${expected_codes} " != *" ${HTTP_STATUS} "* ]]; then
+    echo "Se esperaba uno de estos códigos: ${expected_codes}" >&2
+    exit 1
+  fi
+}
+
+build_mcp_body() {
+  local request_id="$1"
+  local method="$2"
+  local params="$3"
+
+  jq -cn \
+    --arg request_id "${request_id}" \
+    --arg method "${method}" \
+    --arg protocol_version "${MCP_PROTOCOL_VERSION}" \
+    --argjson params "${params}" \
+    '{
+      jsonrpc: "2.0",
+      id: $request_id,
+      method: $method,
+      params: ($params + {
+        _meta: {
+          "io.modelcontextprotocol/protocolVersion": $protocol_version,
+          "io.modelcontextprotocol/clientInfo": {
+            name: "entropy-e2e-test",
+            version: "1.0.0"
+          },
+          "io.modelcontextprotocol/clientCapabilities": {}
+        }
+      })
+    }'
+}
+
+call_mcp() {
+  local method="$1"
+  local request_id="$2"
+  local params="$3"
+  local expected_codes="$4"
+  local tool_name="${5:-}"
+  local payload
+  local -a headers
+
+  payload="$(build_mcp_body "${request_id}" "${method}" "${params}")"
+  headers=(
+    --header "Authorization: Bearer ${MCP_API_KEY}"
+    --header 'Content-Type: application/json'
+    --header 'Accept: application/json, text/event-stream'
+    --header "MCP-Protocol-Version: ${MCP_PROTOCOL_VERSION}"
+    --header "Mcp-Method: ${method}"
+  )
+
+  if [[ -n "${tool_name}" ]]; then
+    headers+=(--header "Mcp-Name: ${tool_name}")
+  fi
+
+  echo
+  if [[ -n "${tool_name}" ]]; then
+    echo "[mcp] ${method} ${tool_name}"
+  else
+    echo "[mcp] ${method}"
+  fi
+
+  HTTP_STATUS="$(curl --silent --show-error \
+    --connect-timeout "${CURL_CONNECT_TIMEOUT}" \
+    --max-time "${CURL_MAX_TIME}" \
+    --output "${BODY_FILE}" \
+    --write-out '%{http_code}' \
+    --request POST \
+    "${headers[@]}" \
+    --data "${payload}" \
+    "${MCP_ENDPOINT}")"
+
+  echo "HTTP ${HTTP_STATUS}"
+  print_body
+
+  if [[ " ${expected_codes} " != *" ${HTTP_STATUS} "* ]]; then
+    echo "Se esperaba uno de estos códigos: ${expected_codes}" >&2
+    exit 1
+  fi
+}
+
+call_mcp_without_auth() {
+  local payload
+
+  payload="$(build_mcp_body \
+    "mcp-auth-${RUN_ID}" \
+    "tools/list" \
+    '{}')"
+
+  echo
+  echo "[mcp] POST sin autenticación"
+
+  HTTP_STATUS="$(curl --silent --show-error \
+    --connect-timeout "${CURL_CONNECT_TIMEOUT}" \
+    --max-time "${CURL_MAX_TIME}" \
+    --output "${BODY_FILE}" \
+    --write-out '%{http_code}' \
+    --request POST \
+    --header 'Content-Type: application/json' \
+    --header 'Accept: application/json, text/event-stream' \
+    --header "MCP-Protocol-Version: ${MCP_PROTOCOL_VERSION}" \
+    --header 'Mcp-Method: tools/list' \
+    --data "${payload}" \
+    "${MCP_ENDPOINT}")"
+
+  echo "HTTP ${HTTP_STATUS}"
+  print_body
+
+  if [[ "${HTTP_STATUS}" != "401" ]]; then
+    fail "MCP debe rechazar peticiones sin autenticación"
+  fi
+
+  pass "MCP rechaza peticiones sin autenticación"
+}
+
+call_mcp_tool() {
+  local tool_name="$1"
+  local arguments="$2"
+  local request_id="${3:-mcp-tool-${RUN_ID}}"
+
+  call_mcp \
+    "tools/call" \
+    "${request_id}" \
+    "$(jq -cn \
+      --arg tool_name "${tool_name}" \
+      --argjson arguments "${arguments}" \
+      '{name: $tool_name, arguments: $arguments}')" \
+    "200" \
+    "${tool_name}"
+}
+
+assert_mcp_success() {
+  local message="$1"
+
+  assert_json \
+    '.error == null and (.result.isError // false) == false' \
+    "${message}"
+}
+
+assert_mcp_tool_error() {
+  local message="$1"
+
+  assert_json \
+    '.error == null and .result.isError == true' \
+    "${message}"
+}
+
+assert_mcp_contains() {
+  local expected_value="$1"
+  local message="$2"
+
+  if ! jq -e \
+    --arg expected_value "${expected_value}" \
+    '[.. | strings | select(contains($expected_value))] | length > 0' \
+    "${BODY_FILE}" >/dev/null; then
+    fail "${message}"
+  fi
+
+  pass "${message}"
 }
 
 assert_json() {
@@ -139,16 +336,49 @@ assert_valid_id() {
 
 echo "Fleet API:    ${FLEET_BASE_URL}"
 echo "Logistic API: ${LOGISTIC_BASE_URL}"
+echo "MCP endpoint: ${MCP_ENDPOINT}"
 echo "RUN_ID:       ${RUN_ID}"
 
-# 1. Comprobar que ambos servicios responden.
+# 1. Comprobar que los tres servicios responden.
 call_api fleet GET "/equipments?page=1&pageSize=1" "200"
 pass "fleet-service está disponible"
 
 call_api logistic GET "/requests?page=1&pageSize=1" "200"
 pass "logistic-service está disponible"
 
-# 2. Crear una flota.
+call_http mcp GET "${MCP_BASE_URL%/}/health" "200"
+pass "entropy-mcp-server está disponible"
+
+# 2. Validar autenticación, descubrimiento y catálogo de herramientas MCP.
+call_mcp_without_auth
+
+call_mcp \
+  "server/discover" \
+  "mcp-discover-${RUN_ID}" \
+  '{}' \
+  "200"
+assert_json \
+  '.error == null and (.result.capabilities.tools | type) == "object"' \
+  "MCP anuncia soporte para tools"
+
+call_mcp \
+  "tools/list" \
+  "mcp-tools-${RUN_ID}" \
+  '{}' \
+  "200"
+assert_json \
+  '([
+    "create_logistics_request",
+    "get_logistics_request",
+    "get_recommendations",
+    "create_assignment",
+    "get_assignment",
+    "complete_assignment",
+    "cancel_assignment"
+  ] - [.result.tools[].name]) | length == 0' \
+  "MCP expone todas las herramientas logísticas esperadas"
+
+# 3. Crear una flota.
 FLEET_PAYLOAD="$(jq -n \
   --arg code "FLEET-E2E-${RUN_ID}" \
   --arg name "Flota E2E ${RUN_ID}" \
@@ -159,7 +389,7 @@ FLEET_ID="$(extract_id)"
 assert_valid_id "${FLEET_ID}" "La flota"
 pass "flota creada: ${FLEET_ID}"
 
-# 3. Crear una excavadora cercana, con buen margen de mantenimiento.
+# 4. Crear una excavadora cercana, con buen margen de mantenimiento.
 NEAR_EQUIPMENT_PAYLOAD="$(jq -n \
   --arg code "EXC-NEAR-${RUN_ID}" \
   --arg serial "SERIAL-NEAR-${RUN_ID}" \
@@ -186,7 +416,7 @@ NEAR_EQUIPMENT_ID="$(extract_id)"
 assert_valid_id "${NEAR_EQUIPMENT_ID}" "La maquinaria cercana"
 pass "maquinaria cercana creada: ${NEAR_EQUIPMENT_ID}"
 
-# 4. Crear otra excavadora más distante y con menor margen.
+# 5. Crear otra excavadora más distante y con menor margen.
 FAR_EQUIPMENT_PAYLOAD="$(jq -n \
   --arg code "EXC-FAR-${RUN_ID}" \
   --arg serial "SERIAL-FAR-${RUN_ID}" \
@@ -213,7 +443,7 @@ FAR_EQUIPMENT_ID="$(extract_id)"
 assert_valid_id "${FAR_EQUIPMENT_ID}" "La maquinaria distante"
 pass "maquinaria distante creada: ${FAR_EQUIPMENT_ID}"
 
-# 5. Agregar ambas maquinarias a la flota.
+# 6. Agregar ambas maquinarias a la flota.
 call_api fleet PUT "/fleets/${FLEET_ID}/equipments/${NEAR_EQUIPMENT_ID}" "200"
 call_api fleet PUT "/fleets/${FLEET_ID}/equipments/${FAR_EQUIPMENT_ID}" "200"
 
@@ -225,9 +455,10 @@ assert_json \
   "[.. | objects | .id? | select(. == \"${FAR_EQUIPMENT_ID}\")] | length > 0" \
   "la flota contiene la maquinaria distante"
 
-# 6. Crear una solicitud logística PENDING en San Miguel.
+# 7. Crear una solicitud logística PENDING en San Miguel mediante MCP.
+PROJECT_NAME="Proyecto integrado ${RUN_ID}"
 REQUEST_PAYLOAD="$(jq -n \
-  --arg project_name "Proyecto integrado ${RUN_ID}" \
+  --arg project_name "${PROJECT_NAME}" \
   '{
     equipmentType: "EXCAVATOR",
     projectName: $project_name,
@@ -240,14 +471,59 @@ REQUEST_PAYLOAD="$(jq -n \
     endDate: "2030-09-15T18:00:00Z"
   }')"
 
-call_api logistic POST "/requests" "201" "${REQUEST_PAYLOAD}"
-REQUEST_ID="$(extract_id)"
+call_mcp_tool \
+  "create_logistics_request" \
+  "${REQUEST_PAYLOAD}" \
+  "mcp-create-request-${RUN_ID}"
+assert_mcp_success "MCP crea la solicitud logística"
+assert_mcp_contains \
+  "${PROJECT_NAME}" \
+  "la respuesta MCP contiene el proyecto creado"
+
+# Se obtiene el ID desde Logistics para validar también la persistencia real.
+call_api logistic GET "/requests?page=1&pageSize=100" "200"
+REQUEST_ID="$(jq -r \
+  --arg project_name "${PROJECT_NAME}" \
+  '[.data[] | select(.projectName == $project_name)] | first | .id // empty' \
+  "${BODY_FILE}")"
 assert_valid_id "${REQUEST_ID}" "La solicitud logística"
+
+call_api logistic GET "/requests/${REQUEST_ID}" "200"
 assert_json '(.data.status // .status) == "PENDING"' \
   "la solicitud inicia en PENDING"
 pass "solicitud creada: ${REQUEST_ID}"
 
-# 7. Logistics consulta Fleet y genera las recomendaciones.
+# 8. Consultar la solicitud y sus recomendaciones mediante MCP.
+call_mcp_tool \
+  "get_logistics_request" \
+  "$(jq -cn --arg request_id "${REQUEST_ID}" '{requestId: $request_id}')" \
+  "mcp-get-request-${RUN_ID}"
+assert_mcp_success "MCP consulta una solicitud logística"
+assert_mcp_contains \
+  "${REQUEST_ID}" \
+  "la respuesta MCP contiene el request solicitado"
+
+call_mcp_tool \
+  "get_recommendations" \
+  "$(jq -cn --arg request_id "${REQUEST_ID}" '{requestId: $request_id}')" \
+  "mcp-recommendations-${RUN_ID}"
+assert_mcp_success "MCP obtiene recomendaciones"
+assert_mcp_contains \
+  "${NEAR_EQUIPMENT_ID}" \
+  "MCP devuelve la maquinaria cercana recomendada"
+assert_mcp_contains \
+  "${FAR_EQUIPMENT_ID}" \
+  "MCP devuelve la maquinaria distante recomendada"
+
+UNKNOWN_REQUEST_ID="11111111-1111-4111-8111-111111111111"
+call_mcp_tool \
+  "get_logistics_request" \
+  "$(jq -cn --arg request_id "${UNKNOWN_REQUEST_ID}" '{requestId: $request_id}')" \
+  "mcp-request-not-found-${RUN_ID}"
+assert_mcp_tool_error \
+  "MCP representa un request inexistente como error de ejecución de tool"
+
+# 9. Logistics consulta Fleet y genera las recomendaciones por REST.
 call_api logistic GET "/requests/${REQUEST_ID}/recommendations" "200"
 
 assert_json \
@@ -279,43 +555,234 @@ fi
 
 pass "ranking correcto: ${NEAR_SCORE} > ${FAR_SCORE}"
 
-# 8. Reservar el equipo mejor recomendado desde Fleet.
-RESERVE_PAYLOAD='{
-  "status": "RESERVED",
-  "reason": "Reservada por prueba integrada de recomendaciones"
-}'
+# 10. Crear la asignación mediante MCP con el equipo mejor recomendado.
+# Primero se comprueba que MCP no ejecute la mutación sin confirmación humana.
+CREATE_ASSIGNMENT_PAYLOAD="$(jq -n \
+  --arg equipment_id "${NEAR_EQUIPMENT_ID}" \
+  '{
+    equipmentId: $equipment_id,
+    reason: "Maquinaria seleccionada de las recomendaciones"
+  }')"
 
-call_api fleet PATCH \
-  "/equipments/${NEAR_EQUIPMENT_ID}/status" \
-  "200" \
-  "${RESERVE_PAYLOAD}"
+MCP_ASSIGNMENT_WITHOUT_CONFIRMATION="$(jq -cn \
+  --arg request_id "${REQUEST_ID}" \
+  --arg equipment_id "${NEAR_EQUIPMENT_ID}" \
+  '{
+    requestId: $request_id,
+    equipmentId: $equipment_id,
+    reason: "Prueba MCP sin confirmación",
+    confirmed: false
+  }')"
 
-# 9. La siguiente recomendación ya no debe incluir el equipo reservado.
-call_api logistic GET "/requests/${REQUEST_ID}/recommendations" "200"
+call_mcp_tool \
+  "create_assignment" \
+  "${MCP_ASSIGNMENT_WITHOUT_CONFIRMATION}" \
+  "mcp-assignment-unconfirmed-${RUN_ID}"
+assert_mcp_tool_error \
+  "MCP rechaza crear una asignación sin confirmed=true"
 
+call_api logistic GET "/requests/${REQUEST_ID}/assignment" "404"
+pass "la llamada MCP sin confirmación no creó una asignación"
+
+MCP_ASSIGNMENT_CONFIRMED="$(jq -cn \
+  --arg request_id "${REQUEST_ID}" \
+  --arg equipment_id "${NEAR_EQUIPMENT_ID}" \
+  '{
+    requestId: $request_id,
+    equipmentId: $equipment_id,
+    reason: "Maquinaria seleccionada de las recomendaciones",
+    confirmed: true
+  }')"
+
+call_mcp_tool \
+  "create_assignment" \
+  "${MCP_ASSIGNMENT_CONFIRMED}" \
+  "mcp-assignment-confirmed-${RUN_ID}"
+assert_mcp_success "MCP crea la asignación confirmada"
+assert_mcp_contains \
+  "${REQUEST_ID}" \
+  "la respuesta MCP contiene el request asignado"
+assert_mcp_contains \
+  "${NEAR_EQUIPMENT_ID}" \
+  "la respuesta MCP contiene el equipo asignado"
+
+call_api logistic GET "/requests/${REQUEST_ID}/assignment" "200"
+ASSIGNMENT_ID="$(extract_id)"
+assert_valid_id "${ASSIGNMENT_ID}" "La asignación"
+assert_json ".data.requestId == \"${REQUEST_ID}\"" \
+  "la asignación pertenece al request"
+assert_json ".data.equipmentId == \"${NEAR_EQUIPMENT_ID}\"" \
+  "la asignación utiliza el equipo recomendado"
+assert_json '.data.status == "ACTIVE"' \
+  "la asignación inicia en ACTIVE"
+
+# 11. Verificar los efectos de la creación en ambos microservicios.
+call_api logistic GET "/requests/${REQUEST_ID}" "200"
+assert_json '(.data.status // .status) == "ASSIGNED"' \
+  "crear Assignment cambia el request a ASSIGNED"
+
+call_api fleet GET "/equipments/${NEAR_EQUIPMENT_ID}" "200"
+assert_json '(.data.status // .status) == "RESERVED"' \
+  "crear Assignment reserva la maquinaria en Fleet"
+
+call_api logistic GET "/requests/${REQUEST_ID}/assignment" "200"
+assert_json ".data.id == \"${ASSIGNMENT_ID}\"" \
+  "consultar Assignment por request devuelve el registro correcto"
+
+call_mcp_tool \
+  "get_assignment" \
+  "$(jq -cn --arg request_id "${REQUEST_ID}" '{requestId: $request_id}')" \
+  "mcp-get-assignment-${RUN_ID}"
+assert_mcp_success "MCP consulta la asignación por request"
+assert_mcp_contains \
+  "${ASSIGNMENT_ID}" \
+  "la respuesta MCP contiene la asignación correcta"
+
+call_api logistic GET "/assignments?status=ACTIVE&page=1&pageSize=100" "200"
 assert_json \
-  ".data.recommendations | all(.equipmentId != \"${NEAR_EQUIPMENT_ID}\")" \
-  "la maquinaria RESERVED queda fuera de las recomendaciones"
-assert_json \
-  ".data.recommendations | any(.equipmentId == \"${FAR_EQUIPMENT_ID}\")" \
-  "la maquinaria AVAILABLE continúa disponible"
+  ".data | any(.id == \"${ASSIGNMENT_ID}\" and .status == \"ACTIVE\")" \
+  "la asignación aparece en el listado de activas"
 
-# 10. Confirmar la solicitud logística.
-ASSIGN_REQUEST_PAYLOAD='{
-  "status": "ASSIGNED",
-  "reason": "Se confirmó la maquinaria recomendada"
-}'
-
-call_api logistic PATCH \
-  "/requests/${REQUEST_ID}/status" \
-  "200" \
-  "${ASSIGN_REQUEST_PAYLOAD}"
-
-# Una solicitud ASSIGNED ya no acepta nuevas recomendaciones.
+# 12. Un request ASSIGNED no acepta recomendaciones ni otra asignación.
 call_api logistic GET "/requests/${REQUEST_ID}/recommendations" "409"
 pass "una solicitud ASSIGNED no genera nuevas recomendaciones"
 
-# 11. Ejecutar el ciclo operacional del equipo.
+call_api logistic POST \
+  "/requests/${REQUEST_ID}/assignment" \
+  "409" \
+  "${CREATE_ASSIGNMENT_PAYLOAD}"
+pass "un request no puede recibir dos asignaciones"
+
+# 13. Crear otro request para comprobar que RESERVED desaparece del inventario.
+SECOND_REQUEST_PAYLOAD="$(jq -n \
+  --arg project_name "Proyecto cancelable ${RUN_ID}" \
+  '{
+    equipmentType: "EXCAVATOR",
+    projectName: $project_name,
+    location: {
+      name: "San Miguel",
+      latitude: 13.4833,
+      longitude: -88.1833
+    },
+    startDate: "2030-10-01T08:00:00Z",
+    endDate: "2030-10-05T18:00:00Z"
+  }')"
+
+call_api logistic POST "/requests" "201" "${SECOND_REQUEST_PAYLOAD}"
+SECOND_REQUEST_ID="$(extract_id)"
+assert_valid_id "${SECOND_REQUEST_ID}" "El segundo request"
+
+call_api logistic GET \
+  "/requests/${SECOND_REQUEST_ID}/recommendations" \
+  "200"
+
+assert_json \
+  ".data.recommendations | all(.equipmentId != \"${NEAR_EQUIPMENT_ID}\")" \
+  "la maquinaria RESERVED no aparece en otro request"
+assert_json \
+  ".data.recommendations | any(.equipmentId == \"${FAR_EQUIPMENT_ID}\")" \
+  "la maquinaria AVAILABLE continúa siendo recomendada"
+
+# 14. El equipo reservado no puede asignarse a otro request.
+RESERVED_ASSIGNMENT_PAYLOAD="$(jq -n \
+  --arg equipment_id "${NEAR_EQUIPMENT_ID}" \
+  '{
+    equipmentId: $equipment_id,
+    reason: "Intento de asignación duplicada"
+  }')"
+
+call_api logistic POST \
+  "/requests/${SECOND_REQUEST_ID}/assignment" \
+  "409" \
+  "${RESERVED_ASSIGNMENT_PAYLOAD}"
+pass "una maquinaria RESERVED no puede asignarse dos veces"
+
+# 15. Asignar el equipo disponible al segundo request.
+CANCEL_ASSIGNMENT_PAYLOAD="$(jq -n \
+  --arg equipment_id "${FAR_EQUIPMENT_ID}" \
+  '{
+    equipmentId: $equipment_id,
+    reason: "Asignación que será cancelada durante la prueba"
+  }')"
+
+call_api logistic POST \
+  "/requests/${SECOND_REQUEST_ID}/assignment" \
+  "201" \
+  "${CANCEL_ASSIGNMENT_PAYLOAD}"
+
+CANCEL_ASSIGNMENT_ID="$(extract_id)"
+assert_valid_id "${CANCEL_ASSIGNMENT_ID}" "La asignación cancelable"
+assert_json '.data.status == "ACTIVE"' \
+  "la segunda asignación inicia en ACTIVE"
+
+call_api fleet GET "/equipments/${FAR_EQUIPMENT_ID}" "200"
+assert_json '(.data.status // .status) == "RESERVED"' \
+  "la segunda asignación reserva la maquinaria distante"
+
+# 16. Rechazar un estado desconocido para Assignment.
+call_api logistic PATCH \
+  "/assignments/${CANCEL_ASSIGNMENT_ID}/status" \
+  "400" \
+  '{
+    "status": "UNKNOWN",
+    "reason": "Estado inválido de prueba"
+  }'
+
+# 17. Cancelar la segunda asignación mediante MCP.
+MCP_CANCEL_WITHOUT_CONFIRMATION="$(jq -cn \
+  --arg assignment_id "${CANCEL_ASSIGNMENT_ID}" \
+  '{
+    assignmentId: $assignment_id,
+    reason: "Prueba de cancelación sin confirmación",
+    confirmed: false
+  }')"
+
+call_mcp_tool \
+  "cancel_assignment" \
+  "${MCP_CANCEL_WITHOUT_CONFIRMATION}" \
+  "mcp-cancel-unconfirmed-${RUN_ID}"
+assert_mcp_tool_error \
+  "MCP rechaza cancelar una asignación sin confirmed=true"
+
+call_api logistic GET "/requests/${SECOND_REQUEST_ID}/assignment" "200"
+assert_json '.data.status == "ACTIVE"' \
+  "la cancelación MCP no confirmada no modifica la asignación"
+
+MCP_CANCEL_CONFIRMED="$(jq -cn \
+  --arg assignment_id "${CANCEL_ASSIGNMENT_ID}" \
+  '{
+    assignmentId: $assignment_id,
+    reason: "El cliente canceló el proyecto",
+    confirmed: true
+  }')"
+
+call_mcp_tool \
+  "cancel_assignment" \
+  "${MCP_CANCEL_CONFIRMED}" \
+  "mcp-cancel-confirmed-${RUN_ID}"
+assert_mcp_success "MCP cancela la asignación confirmada"
+assert_mcp_contains \
+  "CANCELLED" \
+  "la respuesta MCP contiene el estado CANCELLED"
+
+call_api logistic GET "/requests/${SECOND_REQUEST_ID}" "200"
+assert_json '(.data.status // .status) == "CANCELLED"' \
+  "cancelar Assignment cambia el request a CANCELLED"
+
+call_api fleet GET "/equipments/${FAR_EQUIPMENT_ID}" "200"
+assert_json '(.data.status // .status) == "AVAILABLE"' \
+  "cancelar Assignment libera la maquinaria"
+
+call_api logistic PATCH \
+  "/assignments/${CANCEL_ASSIGNMENT_ID}/status" \
+  "422" \
+  '{
+    "status": "COMPLETED",
+    "reason": "Intento desde un estado terminal"
+  }'
+pass "CANCELLED es un estado terminal"
+
+# 18. Ejecutar el ciclo operacional del equipo de la asignación principal.
 call_api fleet PATCH \
   "/equipments/${NEAR_EQUIPMENT_ID}/status" \
   "200" \
@@ -332,33 +799,62 @@ call_api fleet PATCH \
     "reason": "Maquinaria recibida en el proyecto"
   }'
 
-# 12. Completar la solicitud y liberar la maquinaria.
-call_api logistic PATCH \
-  "/requests/${REQUEST_ID}/status" \
-  "200" \
+# 19. Completar Assignment mediante MCP debe completar el request y liberar el equipo.
+MCP_COMPLETE_WITHOUT_CONFIRMATION="$(jq -cn \
+  --arg assignment_id "${ASSIGNMENT_ID}" \
   '{
-    "status": "COMPLETED",
-    "reason": "Operación logística completada"
-  }'
+    assignmentId: $assignment_id,
+    reason: "Prueba de finalización sin confirmación",
+    confirmed: false
+  }')"
 
-call_api fleet PATCH \
-  "/equipments/${NEAR_EQUIPMENT_ID}/status" \
-  "200" \
+call_mcp_tool \
+  "complete_assignment" \
+  "${MCP_COMPLETE_WITHOUT_CONFIRMATION}" \
+  "mcp-complete-unconfirmed-${RUN_ID}"
+assert_mcp_tool_error \
+  "MCP rechaza completar una asignación sin confirmed=true"
+
+call_api logistic GET "/requests/${REQUEST_ID}/assignment" "200"
+assert_json '.data.status == "ACTIVE"' \
+  "la finalización MCP no confirmada no modifica la asignación"
+
+MCP_COMPLETE_CONFIRMED="$(jq -cn \
+  --arg assignment_id "${ASSIGNMENT_ID}" \
   '{
-    "status": "AVAILABLE",
-    "reason": "Trabajo terminado y maquinaria liberada"
-  }'
+    assignmentId: $assignment_id,
+    reason: "Operación logística completada",
+    confirmed: true
+  }')"
 
-# 13. Verificar el estado final de ambas entidades.
+call_mcp_tool \
+  "complete_assignment" \
+  "${MCP_COMPLETE_CONFIRMED}" \
+  "mcp-complete-confirmed-${RUN_ID}"
+assert_mcp_success "MCP completa la asignación confirmada"
+assert_mcp_contains \
+  "COMPLETED" \
+  "la respuesta MCP contiene el estado COMPLETED"
+
+# 20. Verificar el estado final de las tres entidades.
 call_api logistic GET "/requests/${REQUEST_ID}" "200"
 assert_json '(.data.status // .status) == "COMPLETED"' \
-  "la solicitud finaliza en COMPLETED"
+  "completar Assignment cambia el request a COMPLETED"
 
 call_api fleet GET "/equipments/${NEAR_EQUIPMENT_ID}" "200"
 assert_json '(.data.status // .status) == "AVAILABLE"' \
-  "la maquinaria vuelve a AVAILABLE"
+  "completar Assignment devuelve la maquinaria a AVAILABLE"
 
-# 14. Verificar los historiales de los dos microservicios.
+call_api logistic GET "/requests/${REQUEST_ID}/assignment" "200"
+assert_json '.data.status == "COMPLETED"' \
+  "consultar por request devuelve Assignment COMPLETED"
+
+call_api logistic GET "/assignments?status=COMPLETED&page=1&pageSize=100" "200"
+assert_json \
+  ".data | any(.id == \"${ASSIGNMENT_ID}\" and .status == \"COMPLETED\")" \
+  "el listado filtrado contiene el Assignment COMPLETED"
+
+# 21. Verificar los historiales de Request y Equipment.
 call_api logistic GET "/requests/${REQUEST_ID}/status-history" "200"
 assert_json \
   '[.. | objects | select(.fromStatus? == "PENDING" and .toStatus? == "ASSIGNED")] | length > 0' \
@@ -381,7 +877,28 @@ assert_json \
   '[.. | objects | select(.fromStatus? == "WORKING" and .toStatus? == "AVAILABLE")] | length > 0' \
   "historial de equipo contiene WORKING -> AVAILABLE"
 
-# 15. Retirar los equipos de la flota al terminar.
+# 22. Una asignación COMPLETED no puede modificarse otra vez.
+call_api logistic PATCH \
+  "/assignments/${ASSIGNMENT_ID}/status" \
+  "422" \
+  '{
+    "status": "CANCELLED",
+    "reason": "Intento desde estado terminal"
+  }'
+pass "COMPLETED es un estado terminal"
+
+# 23. Un Assignment inexistente devuelve 404.
+NOT_FOUND_ASSIGNMENT_ID="11111111-1111-4111-8111-111111111111"
+
+call_api logistic PATCH \
+  "/assignments/${NOT_FOUND_ASSIGNMENT_ID}/status" \
+  "404" \
+  '{
+    "status": "CANCELLED",
+    "reason": "Asignación inexistente"
+  }'
+
+# 24. Retirar los equipos de la flota al terminar.
 call_api fleet DELETE \
   "/fleets/${FLEET_ID}/equipments/${NEAR_EQUIPMENT_ID}" \
   "204"
@@ -396,3 +913,6 @@ echo "FLEET_ID=${FLEET_ID}"
 echo "NEAR_EQUIPMENT_ID=${NEAR_EQUIPMENT_ID}"
 echo "FAR_EQUIPMENT_ID=${FAR_EQUIPMENT_ID}"
 echo "REQUEST_ID=${REQUEST_ID}"
+echo "SECOND_REQUEST_ID=${SECOND_REQUEST_ID}"
+echo "ASSIGNMENT_ID=${ASSIGNMENT_ID}"
+echo "CANCEL_ASSIGNMENT_ID=${CANCEL_ASSIGNMENT_ID}"

@@ -6,3 +6,6 @@
 	path = logistic-service
 	url = https://github.com/tariq-ventura/logistic-service.git
 	branch = main
+[submodule "entropy-mcp-server"]
+	path = entropy-mcp-server
+	url = https://github.com/tariq-ventura/entropy-mcp-server.git
