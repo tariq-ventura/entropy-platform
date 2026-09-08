@@ -19,6 +19,9 @@ set -euo pipefail
 #   LOGISTIC_BASE_URL=http://localhost:3001/api/v1 \
 #   MCP_BASE_URL=http://localhost:3002 \
 #   MCP_API_KEY=entropy-local-secret \
+#   EMBEDDING_PROVIDER_EXPECTED=ollama \
+#   OLLAMA_BASE_URL=http://localhost:11434 \
+#   OLLAMA_EMBEDDING_MODEL=nomic-embed-text-v2-moe \
 #   ./fleet-logistic-e2e-test.sh
 
 FLEET_BASE_URL="${FLEET_BASE_URL:-http://localhost:3000/api/v1}"
@@ -27,8 +30,11 @@ MCP_BASE_URL="${MCP_BASE_URL:-http://localhost:3002}"
 MCP_ENDPOINT="${MCP_BASE_URL%/}/mcp"
 MCP_API_KEY="${MCP_API_KEY:-entropy-local-secret}"
 MCP_PROTOCOL_VERSION="${MCP_PROTOCOL_VERSION:-2026-07-28}"
+EMBEDDING_PROVIDER_EXPECTED="${EMBEDDING_PROVIDER_EXPECTED:-}"
+OLLAMA_BASE_URL="${OLLAMA_BASE_URL:-http://localhost:11434}"
+OLLAMA_EMBEDDING_MODEL="${OLLAMA_EMBEDDING_MODEL:-nomic-embed-text-v2-moe}"
 CURL_CONNECT_TIMEOUT="${CURL_CONNECT_TIMEOUT:-5}"
-CURL_MAX_TIME="${CURL_MAX_TIME:-30}"
+CURL_MAX_TIME="${CURL_MAX_TIME:-60}"
 RUN_ID="${RUN_ID:-$(date +%s)}"
 BODY_FILE="$(mktemp)"
 
@@ -40,6 +46,8 @@ REQUEST_ID=""
 SECOND_REQUEST_ID=""
 ASSIGNMENT_ID=""
 CANCEL_ASSIGNMENT_ID=""
+SEMANTIC_EARTHWORK_REQUEST_ID=""
+SEMANTIC_LIFTING_REQUEST_ID=""
 
 cleanup() {
   rm -f "${BODY_FILE}"
@@ -317,6 +325,22 @@ assert_json() {
   pass "${message}"
 }
 
+assert_json_arg() {
+  local argument_name="$1"
+  local argument_value="$2"
+  local expression="$3"
+  local message="$4"
+
+  if ! jq -e \
+    --arg "${argument_name}" "${argument_value}" \
+    "${expression}" \
+    "${BODY_FILE}" >/dev/null; then
+    fail "${message}"
+  fi
+
+  pass "${message}"
+}
+
 extract_id() {
   jq -er '.data.id // .id // empty' "${BODY_FILE}"
 }
@@ -334,9 +358,21 @@ assert_valid_id() {
   fi
 }
 
+semantic_score_by_project() {
+  local project_name="$1"
+
+  jq -er \
+    --arg project_name "${project_name}" \
+    '.data.requests[]? |
+      select(.projectName == $project_name) |
+      .semanticScore' \
+    "${BODY_FILE}"
+}
+
 echo "Fleet API:    ${FLEET_BASE_URL}"
 echo "Logistic API: ${LOGISTIC_BASE_URL}"
 echo "MCP endpoint: ${MCP_ENDPOINT}"
+echo "Embedding:    ${EMBEDDING_PROVIDER_EXPECTED:-no verificado directamente}"
 echo "RUN_ID:       ${RUN_ID}"
 
 # 1. Comprobar que los tres servicios responden.
@@ -348,6 +384,16 @@ pass "logistic-service está disponible"
 
 call_http mcp GET "${MCP_BASE_URL%/}/health" "200"
 pass "entropy-mcp-server está disponible"
+
+# La comprobación directa de Ollama es opcional. Las pruebas semánticas que
+# aparecen más adelante se ejecutan siempre y son independientes del proveedor.
+if [[ "${EMBEDDING_PROVIDER_EXPECTED,,}" == "ollama" ]]; then
+  call_http ollama GET "${OLLAMA_BASE_URL%/}/api/tags" "200"
+  assert_json_arg \
+    model "${OLLAMA_EMBEDDING_MODEL}" \
+    '.models | any((.name // .model // "") | startswith($model))' \
+    "Ollama tiene disponible el modelo de embeddings esperado"
+fi
 
 # 2. Validar autenticación, descubrimiento y catálogo de herramientas MCP.
 call_mcp_without_auth
@@ -370,6 +416,7 @@ assert_json \
   '([
     "create_logistics_request",
     "get_logistics_request",
+    "search_logistics_requests",
     "get_recommendations",
     "create_assignment",
     "get_assignment",
@@ -467,6 +514,8 @@ REQUEST_PAYLOAD="$(jq -n \
       latitude: 13.4833,
       longitude: -88.1833
     },
+    description: "Excavación y preparación de terreno para una obra comercial",
+    requirements: "Excavadora con capacidad mínima de veinte toneladas",
     startDate: "2030-09-10T08:00:00Z",
     endDate: "2030-09-15T18:00:00Z"
   }')"
@@ -493,7 +542,155 @@ assert_json '(.data.status // .status) == "PENDING"' \
   "la solicitud inicia en PENDING"
 pass "solicitud creada: ${REQUEST_ID}"
 
-# 8. Consultar la solicitud y sus recomendaciones mediante MCP.
+# 8. Crear documentos semánticamente distintos. Se usan textos que permiten
+# comprobar significado sin depender de coincidencias literales.
+EARTHWORK_PROJECT="Urbanización Oriente ${RUN_ID}"
+EARTHWORK_PAYLOAD="$(jq -n \
+  --arg project_name "${EARTHWORK_PROJECT}" \
+  '{
+    equipmentType: "EXCAVATOR",
+    projectName: $project_name,
+    location: {
+      name: "Santa Rosa de Lima, La Unión",
+      latitude: 13.6247,
+      longitude: -87.8934
+    },
+    description: "Preparación y nivelación del suelo para construir locales comerciales",
+    requirements: "Movimiento de tierra y excavación con maquinaria pesada",
+    startDate: "2030-11-01T08:00:00Z",
+    endDate: "2030-11-08T17:00:00Z"
+  }')"
+
+call_api logistic POST "/requests" "201" "${EARTHWORK_PAYLOAD}"
+SEMANTIC_EARTHWORK_REQUEST_ID="$(extract_id)"
+assert_valid_id \
+  "${SEMANTIC_EARTHWORK_REQUEST_ID}" \
+  "La solicitud semántica de movimiento de tierra"
+
+LIFTING_PROJECT="Puente Metropolitano ${RUN_ID}"
+LIFTING_PAYLOAD="$(jq -n \
+  --arg project_name "${LIFTING_PROJECT}" \
+  '{
+    equipmentType: "CRANE",
+    projectName: $project_name,
+    location: {
+      name: "San Salvador",
+      latitude: 13.6929,
+      longitude: -89.2182
+    },
+    description: "Montaje de estructuras metálicas para la construcción de un puente",
+    requirements: "Grúa para elevar vigas y componentes de gran peso",
+    startDate: "2030-12-01T08:00:00Z",
+    endDate: "2030-12-10T17:00:00Z"
+  }')"
+
+call_api logistic POST "/requests" "201" "${LIFTING_PAYLOAD}"
+SEMANTIC_LIFTING_REQUEST_ID="$(extract_id)"
+assert_valid_id \
+  "${SEMANTIC_LIFTING_REQUEST_ID}" \
+  "La solicitud semántica de elevación"
+
+# La intención se expresa con términos diferentes a los documentos indexados.
+call_api logistic QUERY "/requests" "200" \
+  '{
+    "semanticQuery": "acondicionar superficie donde funcionarán tiendas",
+    "page": 1,
+    "pageSize": 100
+  }'
+assert_json_arg \
+  project_name "${EARTHWORK_PROJECT}" \
+  '.data.requests | any(.projectName == $project_name and (.semanticScore | type) == "number")' \
+  "la búsqueda vectorial encuentra el proyecto de movimiento de tierra"
+
+EARTHWORK_SCORE="$(semantic_score_by_project "${EARTHWORK_PROJECT}")"
+LIFTING_SCORE="$(semantic_score_by_project "${LIFTING_PROJECT}")"
+
+if ! jq -en \
+  --argjson earthwork "${EARTHWORK_SCORE}" \
+  --argjson lifting "${LIFTING_SCORE}" \
+  '$earthwork > $lifting' >/dev/null; then
+  fail "el proyecto de movimiento de tierra debería superar al proyecto de elevación"
+fi
+pass "ranking semántico de terreno correcto: ${EARTHWORK_SCORE} > ${LIFTING_SCORE}"
+
+# La intención inversa debe dar mayor score al proyecto de elevación.
+call_api logistic QUERY "/requests" "200" \
+  '{
+    "semanticQuery": "equipo para levantar piezas metálicas pesadas",
+    "page": 1,
+    "pageSize": 100
+  }'
+assert_json_arg \
+  project_name "${LIFTING_PROJECT}" \
+  '.data.requests | any(.projectName == $project_name and (.semanticScore | type) == "number")' \
+  "la búsqueda vectorial encuentra el proyecto de elevación"
+
+LIFTING_QUERY_LIFTING_SCORE="$(semantic_score_by_project "${LIFTING_PROJECT}")"
+LIFTING_QUERY_EARTHWORK_SCORE="$(semantic_score_by_project "${EARTHWORK_PROJECT}")"
+
+if ! jq -en \
+  --argjson lifting "${LIFTING_QUERY_LIFTING_SCORE}" \
+  --argjson earthwork "${LIFTING_QUERY_EARTHWORK_SCORE}" \
+  '$lifting > $earthwork' >/dev/null; then
+  fail "el proyecto de elevación debería superar al proyecto de movimiento de tierra"
+fi
+pass "ranking semántico de elevación correcto: ${LIFTING_QUERY_LIFTING_SCORE} > ${LIFTING_QUERY_EARTHWORK_SCORE}"
+
+# Combinar vector, filtros estructurados y radio geográfico.
+HYBRID_SEARCH_PAYLOAD='{
+  "semanticQuery": "preparar terreno para construir una zona comercial",
+  "statuses": ["PENDING"],
+  "equipmentType": "EXCAVATOR",
+  "near": {
+    "latitude": 13.6247,
+    "longitude": -87.8934,
+    "radiusKm": 20
+  },
+  "page": 1,
+  "pageSize": 100
+}'
+
+call_api logistic QUERY "/requests" "200" "${HYBRID_SEARCH_PAYLOAD}"
+assert_json_arg \
+  project_name "${EARTHWORK_PROJECT}" \
+  '.data.requests | any(
+    .projectName == $project_name
+    and (.semanticScore | type) == "number"
+    and (.distanceKm | type) == "number"
+  )' \
+  "la búsqueda híbrida devuelve similitud y distancia"
+assert_json_arg \
+  lifting_project "${LIFTING_PROJECT}" \
+  '.data.requests | all(.projectName != $lifting_project)' \
+  "la búsqueda híbrida excluye el proyecto fuera del radio y tipo solicitados"
+
+# Validaciones negativas del contrato semántico.
+call_api logistic QUERY "/requests" "400" \
+  '{
+    "semanticQuery": "movimiento de tierra",
+    "minSemanticScore": 1.1
+  }'
+assert_json '.error == "invalid_semantic_score"' \
+  "se rechaza un minSemanticScore fuera del rango permitido"
+
+call_api logistic QUERY "/requests" "400" \
+  '{
+    "minSemanticScore": 0.5
+  }'
+assert_json '.error == "semantic_query_required"' \
+  "minSemanticScore requiere semanticQuery"
+
+# Probar la misma búsqueda por la herramienta MCP.
+call_mcp_tool \
+  "search_logistics_requests" \
+  "${HYBRID_SEARCH_PAYLOAD}" \
+  "mcp-semantic-search-${RUN_ID}"
+assert_mcp_success "MCP ejecuta una búsqueda híbrida"
+assert_mcp_contains \
+  "${EARTHWORK_PROJECT}" \
+  "MCP devuelve el proyecto semánticamente relacionado"
+
+# 9. Consultar la solicitud y sus recomendaciones mediante MCP.
 call_mcp_tool \
   "get_logistics_request" \
   "$(jq -cn --arg request_id "${REQUEST_ID}" '{requestId: $request_id}')" \
@@ -523,7 +720,7 @@ call_mcp_tool \
 assert_mcp_tool_error \
   "MCP representa un request inexistente como error de ejecución de tool"
 
-# 9. Logistics consulta Fleet y genera las recomendaciones por REST.
+# 10. Logistics consulta Fleet y genera las recomendaciones por REST.
 call_api logistic GET "/requests/${REQUEST_ID}/recommendations" "200"
 
 assert_json \
@@ -555,7 +752,7 @@ fi
 
 pass "ranking correcto: ${NEAR_SCORE} > ${FAR_SCORE}"
 
-# 10. Crear la asignación mediante MCP con el equipo mejor recomendado.
+# 11. Crear la asignación mediante MCP con el equipo mejor recomendado.
 # Primero se comprueba que MCP no ejecute la mutación sin confirmación humana.
 CREATE_ASSIGNMENT_PAYLOAD="$(jq -n \
   --arg equipment_id "${NEAR_EQUIPMENT_ID}" \

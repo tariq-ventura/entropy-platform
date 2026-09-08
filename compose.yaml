@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: postgres:17-alpine
+    image: pgvector/pgvector:pg17
     container_name: entropy-postgres
     environment:
       POSTGRES_USER: app
@@ -44,6 +44,15 @@ services:
       postgres:
         condition: service_healthy
 
+  ollama:
+    image: ollama/ollama:latest
+    container_name: entropy-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+
   logistic-service:
     build:
       context: ./logistic-service
@@ -54,6 +63,10 @@ services:
       DB_CONTEXT: postgresql
       SERVICE_NAME: logistic-service
       TRACE_TYPE: NONE
+      EMBEDDING_PROVIDER: "ollama"
+      OLLAMA_URL: "http://ollama:11434"
+      OLLAMA_EMBEDDING_MODEL: "nomic-embed-text-v2-moe"
+      EMBEDDING_CONTEXT: "ollama"
       DB_STRING: >-
         host=postgres
         user=app
@@ -71,6 +84,8 @@ services:
       postgres:
         condition: service_healthy
       fleet-service:
+        condition: service_started
+      ollama:
         condition: service_started
     restart: unless-stopped
 
@@ -109,3 +124,4 @@ services:
 volumes:
   postgres_data:
   n8n_data:
+  ollama_data:
