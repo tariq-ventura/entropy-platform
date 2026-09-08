@@ -1,1283 +1,1005 @@
 # Entropy Platform
 
-Repositorio de integración para la plataforma **Entropy**, compuesto por dos microservicios independientes administrados como **Git submodules**:
+Plataforma inteligente para administrar flotas de maquinaria pesada, registrar solicitudes logísticas, recomendar el equipo más conveniente y controlar su asignación durante todo el ciclo operativo.
 
-- **`fleet-service`**: administra flotas, maquinaria pesada, disponibilidad y ciclo operativo de los equipos.
-- **`logistic-service`**: administra solicitudes logísticas y genera recomendaciones de maquinaria consultando a `fleet-service`.
+El MVP integra:
 
-El repositorio padre no reemplaza a los repositorios de los microservicios. Su objetivo es mantener una **versión integrada y reproducible** de ambos servicios, junto con la infraestructura local, inicialización de PostgreSQL y pruebas end-to-end.
+- `fleet-service`: flotas, maquinaria, ubicación y estados operativos;
+- `logistic-service`: solicitudes, búsqueda híbrida, recomendaciones y asignaciones;
+- `entropy-mcp-server`: herramientas seguras para asistentes y automatizaciones;
+- `n8n`: conversación, geocodificación y orquestación del asistente;
+- PostgreSQL con `pgvector`: datos operativos y búsqueda semántica;
+- Ollama en local y Vertex AI en Google Cloud para generar embeddings.
 
----
+> Estado actual: el backend funcional y su flujo integrado están implementados y cubiertos por pruebas E2E. El frontend Next.js y el despliegue productivo en GCP forman parte de la siguiente etapa.
 
-## Tabla de contenido
+## Contenido
 
+- [Qué puede hacer el MVP](#qué-puede-hacer-el-mvp)
 - [Arquitectura](#arquitectura)
-- [Responsabilidades de cada servicio](#responsabilidades-de-cada-servicio)
-- [Estructura del repositorio](#estructura-del-repositorio)
+- [Estructura de repositorios](#estructura-de-repositorios)
 - [Tecnologías](#tecnologías)
-- [Requisitos](#requisitos)
-- [Git submodules](#git-submodules)
-- [Levantar la plataforma localmente](#levantar-la-plataforma-localmente)
-- [Servicios y puertos](#servicios-y-puertos)
-- [Base de datos](#base-de-datos)
-- [Health checks](#health-checks)
-- [API de Fleet Service](#api-de-fleet-service)
-- [API de Logistic Service](#api-de-logistic-service)
-- [Estados y flujos](#estados-y-flujos)
-- [Motor de recomendaciones](#motor-de-recomendaciones)
-- [Caso de uso integrado](#caso-de-uso-integrado)
-- [Prueba end-to-end](#prueba-end-to-end)
-- [Comandos útiles](#comandos-útiles)
+- [Inicio rápido](#inicio-rápido)
+- [Configuración](#configuración)
+- [API de Fleet](#api-de-fleet)
+- [API de Logistics](#api-de-logistics)
+- [Búsqueda literal, geográfica y vectorial](#búsqueda-literal-geográfica-y-vectorial)
+- [Algoritmo de recomendaciones](#algoritmo-de-recomendaciones)
+- [Ciclo de asignaciones](#ciclo-de-asignaciones)
+- [MCP Server](#mcp-server)
+- [Flujo de n8n](#flujo-de-n8n)
+- [Pruebas E2E](#pruebas-e2e)
 - [Observabilidad](#observabilidad)
-- [Desarrollo de los submódulos](#desarrollo-de-los-submódulos)
+- [Arquitectura objetivo en GCP](#arquitectura-objetivo-en-gcp)
+- [Desarrollo con submódulos](#desarrollo-con-submódulos)
 - [Solución de problemas](#solución-de-problemas)
+- [Limitaciones del MVP](#limitaciones-del-mvp)
 
----
+## Qué puede hacer el MVP
 
-# Arquitectura
+### Gestión de flota
+
+- Crear, consultar, actualizar y eliminar flotas.
+- Crear, consultar, filtrar, actualizar y eliminar maquinaria.
+- Agregar o retirar maquinaria de una flota mediante `Equipment.FleetID`.
+- Buscar equipos por texto y filtrar por estado.
+- Cambiar el estado operativo de una máquina y conservar su historial.
+- Evitar códigos y números de serie duplicados con respuestas HTTP correctas, por ejemplo `409 Conflict`.
+- Generar UUID aleatorios para las entidades, en lugar de identificadores incrementales o UUID cero.
+
+### Operación logística
+
+- Crear y mantener solicitudes de maquinaria.
+- Controlar el ciclo de estados de cada solicitud.
+- Buscar solicitudes por texto literal, significado y proximidad geográfica.
+- Recomendar solamente maquinaria compatible y disponible.
+- Ordenar las recomendaciones con un algoritmo determinista y explicable.
+- Crear una asignación a partir de una recomendación.
+- Reservar la maquinaria en Fleet al asignarla.
+- Completar o cancelar una asignación y liberar la maquinaria.
+- Impedir asignaciones duplicadas y operaciones incompatibles con el estado actual.
+
+### Asistente y automatización
+
+- Exponer las operaciones logísticas como herramientas MCP.
+- Consultar solicitudes con lenguaje natural sin pedir UUID constantemente.
+- Convertir una dirección escrita por el usuario en coordenadas mediante Google Maps en n8n.
+- Exigir confirmación antes de ejecutar acciones operativas sensibles.
+- Mantener al LLM fuera de la base de datos: el asistente solo puede actuar mediante APIs y herramientas autorizadas.
+
+## Arquitectura
 
 ```mermaid
-flowchart LR
-    C[Cliente / Frontend]
-
-    C -->|REST :3000| F[Fleet Service]
-    C -->|REST :3001| L[Logistic Service]
-
-    L -->|HTTP interno| F
-
-    F --> FDB[(fleet_db)]
-    L --> LDB[(logistics_db)]
-
-    FDB --> PG[(PostgreSQL 17)]
-    LDB --> PG
+flowchart TD
+    U["Usuario"] --> N["n8n · chat y agente"]
+    N --> M["Entropy MCP Server"]
+    N --> G["Google Maps · geocoding"]
+    M --> L["Logistic Service"]
+    L --> F["Fleet Service"]
+    F --> PF[("fleet_db")]
+    L --> PL[("logistics_db + pgvector")]
+    L --> E["Ollama local / Vertex AI cloud"]
 ```
 
-En el entorno local, Docker Compose levanta una sola instancia de PostgreSQL y crea dos bases de datos independientes:
+El flujo HTTP normal sigue disponible para el frontend y para integraciones directas. MCP no sustituye las APIs; ofrece una capa de herramientas controladas para agentes de IA.
 
-```text
-fleet-service    ──────> fleet_db
-logistic-service ──────> logistics_db
+### Responsabilidades
 
-logistic-service ─HTTP─> fleet-service
-```
+| Componente | Responsabilidad |
+| --- | --- |
+| `fleet-service` | Fuente de verdad de flotas, equipos, ubicación, telemetría básica y estado operativo. |
+| `logistic-service` | Solicitudes, búsqueda, recomendaciones, asignaciones y reglas de negocio logísticas. |
+| `entropy-mcp-server` | Traduce llamadas MCP en operaciones de Logistics sin exponer la base de datos. |
+| `n8n` | Recibe mensajes, coordina el modelo, geocodifica ubicaciones y presenta confirmaciones. |
+| PostgreSQL | Mantiene datos relacionales en dos bases independientes. |
+| `pgvector` | Almacena embeddings y calcula similitud semántica. |
+| Ollama / Vertex AI | Genera embeddings; no decide qué maquinaria debe asignarse. |
 
-La comunicación interna entre los microservicios utiliza el DNS de Docker Compose:
+## Estructura de repositorios
 
-```text
-http://fleet-service:3000
-```
-
-Desde la máquina host las APIs están disponibles en:
-
-```text
-Fleet API:    http://localhost:3000
-Logistic API: http://localhost:3001
-```
-
----
-
-# Responsabilidades de cada servicio
-
-## Fleet Service
-
-Responsable del inventario y operación de maquinaria pesada.
-
-Permite:
-
-- registrar maquinaria;
-- consultar maquinaria con filtros y paginación;
-- actualizar información de maquinaria;
-- controlar el estado operativo de cada equipo;
-- consultar el historial de cambios de estado;
-- crear y administrar flotas;
-- agregar maquinaria a una flota;
-- retirar maquinaria de una flota;
-- consultar la maquinaria perteneciente a una flota.
-
-## Logistic Service
-
-Responsable de las necesidades logísticas de los proyectos.
-
-Permite:
-
-- crear solicitudes logísticas;
-- consultar y modificar solicitudes pendientes;
-- controlar el ciclo de vida de una solicitud;
-- consultar su historial de estados;
-- consultar a `fleet-service` para encontrar equipos elegibles;
-- calcular distancia, mantenimiento disponible y combustible;
-- generar un ranking de recomendaciones.
-
----
-
-# Estructura del repositorio
+El repositorio padre integra tres submódulos:
 
 ```text
 entropy-platform/
-├── .gitmodules
-├── README.md
-├── compose.yaml
-│
+├── entropy-mcp-server/        # Servidor MCP en Go
+├── fleet-service/             # Dominio de flotas y maquinaria
+├── logistic-service/          # Dominio de solicitudes y asignaciones
 ├── postgres/
-│   └── init.sql
-│
-├── fleet-logistic-e2e-test.sh
-│
-├── fleet-service/          # Git submodule
-│   ├── cmd/
-│   ├── internal/
-│   ├── Dockerfile
-│   ├── go.mod
-│   └── README.md
-│
-└── logistic-service/       # Git submodule
-    ├── cmd/
-    ├── internal/
-    ├── Dockerfile
-    ├── go.mod
-    └── README.md
+│   └── init.sql               # Crea fleet_db y logistics_db
+├── compose.yaml               # Entorno integrado local
+├── fleet-logistic-e2e-test.sh # Suite de integración completa
+├── seed-demo-data.sh          # Datos consistentes para la demo
+└── README.md
 ```
 
-Los directorios `fleet-service/` y `logistic-service/` son repositorios independientes. `entropy-platform` solamente conserva el commit exacto de cada uno que forma parte de la versión integrada.
+Cada microservicio conserva su propio código, migraciones, `go.mod`, `Dockerfile` y pruebas unitarias. El repositorio padre fija versiones compatibles y contiene los elementos de integración.
 
----
+## Tecnologías
 
-# Tecnologías
+| Área | Tecnología |
+| --- | --- |
+| Backend | Go, Gin y GORM |
+| Base de datos | PostgreSQL 17 y `pgvector` |
+| Identificadores | UUID v4 |
+| Contrato de IA | Model Context Protocol (MCP) |
+| Automatización | n8n |
+| Embeddings locales | Ollama + `nomic-embed-text-v2-moe` |
+| Embeddings cloud | Vertex AI + `text-multilingual-embedding-002` |
+| Geocodificación | Google Maps Geocoding API |
+| Observabilidad | OpenTelemetry y logging estructurado |
+| Contenedores | Docker y Docker Compose |
+| Frontend planificado | Next.js en Cloud Run |
+| Backend cloud planificado | GKE Autopilot |
+| CI/CD planificado | GitHub, Cloud Build, Artifact Registry y Cloud Deploy |
 
-| Tecnología | Uso |
-|---|---|
-| Go 1.27 | Desarrollo de los microservicios |
-| Gin | APIs HTTP REST |
-| GORM | ORM y acceso a datos |
-| PostgreSQL 17 | Persistencia |
-| UUID | Identificadores de entidades |
-| Docker | Construcción de imágenes |
-| Docker Compose | Orquestación local de la plataforma |
-| Git Submodules | Integración de los repositorios independientes |
-| OpenTelemetry | Trazas distribuidas |
-| OTLP/gRPC | Exportación de telemetría |
-| Google Cloud Logging | Logging opcional en GCP |
-| Google Error Reporting | Reporte opcional de errores |
-| Bash | Prueba integrada E2E |
-| curl | Ejecución de peticiones HTTP en las pruebas |
-| jq | Construcción y validación de JSON en las pruebas |
+## Inicio rápido
 
----
+### Requisitos
 
-# Requisitos
+- Git con soporte para submódulos;
+- Docker Engine y Docker Compose;
+- `curl` y `jq` para ejecutar la suite E2E;
+- puertos `3000`, `3001`, `3002`, `5432`, `5678` y `11434` disponibles.
 
-Para levantar toda la plataforma mediante Docker Compose se requiere:
-
-- Git;
-- Docker;
-- Docker Compose v2.
-
-Para ejecutar la prueba integrada también se requiere:
-
-- `bash`;
-- `curl`;
-- `jq`.
-
-Comprobar versiones:
+### 1. Clonar los submódulos
 
 ```bash
-git --version
-docker --version
-docker compose version
-curl --version
-jq --version
-```
-
-No es necesario instalar PostgreSQL ni Go localmente si ambos servicios se ejecutarán con Docker Compose.
-
----
-
-# Git submodules
-
-## Clonar el proyecto por primera vez
-
-La forma recomendada es clonar el repositorio padre junto con todos sus submódulos:
-
-```bash
-git clone --recurse-submodules <URL_DEL_REPOSITORIO_ENTROPY_PLATFORM>
-cd entropy-platform
-```
-
-Comprobar los submódulos:
-
-```bash
-git submodule status
-```
-
-## Si el repositorio ya fue clonado sin los submódulos
-
-Ejecutar:
-
-```bash
+git submodule sync --recursive
 git submodule update --init --recursive
 ```
 
-## Actualizar los commits registrados por el repo padre
-
-Cada microservicio puede evolucionar de manera independiente.
-
-Ejemplo para `fleet-service`:
-
-```bash
-cd fleet-service
-git switch main
-git pull
-cd ..
-```
-
-Ejemplo para `logistic-service`:
-
-```bash
-cd logistic-service
-git switch main
-git pull
-cd ..
-```
-
-Después de actualizar uno o ambos submódulos, el repositorio padre detectará que ahora apuntan a commits nuevos:
-
-```bash
-git status
-```
-
-Registrar la nueva combinación integrada:
-
-```bash
-git add fleet-service logistic-service
-git commit -m "chore: update service submodules"
-git push
-```
-
-> El commit del repositorio padre no copia el código de los servicios. Guarda el commit específico al que apunta cada submódulo.
-
-## Restaurar la versión exacta definida por `entropy-platform`
-
-Si un submódulo fue cambiado localmente y se quiere volver al commit registrado por el padre:
-
-```bash
-git submodule update --init --recursive
-```
-
----
-
-# Levantar la plataforma localmente
-
-## 1. Clonar e inicializar submódulos
-
-```bash
-git clone --recurse-submodules <URL_DEL_REPOSITORIO_ENTROPY_PLATFORM>
-cd entropy-platform
-```
-
-Si ya existe el clone:
-
-```bash
-git submodule update --init --recursive
-```
-
-## 2. Construir y levantar todos los servicios
-
-Desde la raíz de `entropy-platform`:
-
-```bash
-docker compose up --build
-```
-
-Para ejecutarlo en segundo plano:
+### 2. Levantar la plataforma
 
 ```bash
 docker compose up -d --build
 ```
 
-Compose construirá las imágenes usando:
+### 3. Descargar el modelo local de embeddings
 
-```text
-./fleet-service/Dockerfile
-./logistic-service/Dockerfile
-```
-
-## 3. Comprobar los contenedores
+La primera ejecución requiere descargar el modelo en el volumen de Ollama:
 
 ```bash
-docker compose ps
+docker exec entropy-ollama ollama pull nomic-embed-text-v2-moe
 ```
 
-Deberían existir al menos:
-
-```text
-entropy-postgres
-fleet-service
-logistic-service
-```
-
-## 4. Revisar logs
-
-```bash
-docker compose logs -f
-```
-
-Solo Fleet:
-
-```bash
-docker compose logs -f fleet-service
-```
-
-Solo Logistics:
-
-```bash
-docker compose logs -f logistic-service
-```
-
-## 5. Detener la plataforma
-
-```bash
-docker compose down
-```
-
-Para detenerla y eliminar también los datos locales de PostgreSQL:
-
-```bash
-docker compose down -v
-```
-
-> `-v` elimina el volumen `postgres_data`. Utilizarlo únicamente cuando se quiera reinicializar completamente la base local.
-
----
-
-# Servicios y puertos
-
-| Servicio | Contenedor | Puerto host | Puerto interno | URL |
-|---|---|---:|---:|---|
-| PostgreSQL | `entropy-postgres` | `5432` | `5432` | `localhost:5432` |
-| Fleet Service | `fleet-service` | `3000` | `3000` | `http://localhost:3000` |
-| Logistic Service | `logistic-service` | `3001` | `3001` | `http://localhost:3001` |
-
-Dentro de la red de Compose, Logistics utiliza:
-
-```env
-FLEET_SERVICE_URL=http://fleet-service:3000
-```
-
-No debe utilizar `localhost:3000` desde el contenedor de Logistics, ya que `localhost` apuntaría al mismo contenedor de `logistic-service`.
-
----
-
-# Base de datos
-
-El servicio PostgreSQL utiliza:
-
-```text
-Usuario:   app
-Password:  app_local_password
-Puerto:    5432
-```
-
-Estas credenciales son únicamente para desarrollo local.
-
-El archivo:
-
-```text
-postgres/init.sql
-```
-
-crea automáticamente:
-
-```sql
-CREATE DATABASE fleet_db OWNER app;
-CREATE DATABASE logistics_db OWNER app;
-```
-
-## Conexiones utilizadas por los servicios
-
-### Fleet
-
-```text
-host=postgres
-user=app
-password=app_local_password
-dbname=fleet_db
-port=5432
-sslmode=disable
-TimeZone=UTC
-```
-
-### Logistics
-
-```text
-host=postgres
-user=app
-password=app_local_password
-dbname=logistics_db
-port=5432
-sslmode=disable
-TimeZone=UTC
-```
-
-## Conectarse manualmente desde el host
-
-Si `psql` está instalado:
-
-```bash
-PGPASSWORD=app_local_password \
-psql -h localhost -p 5432 -U app -d fleet_db
-```
-
-Para Logistics:
-
-```bash
-PGPASSWORD=app_local_password \
-psql -h localhost -p 5432 -U app -d logistics_db
-```
-
----
-
-# Health checks
-
-## Fleet Service
+### 4. Verificar los servicios
 
 ```bash
 curl http://localhost:3000/health
-```
-
-Respuesta esperada:
-
-```json
-{
-  "Status": "Up and Running"
-}
-```
-
-## Logistic Service
-
-```bash
 curl http://localhost:3001/health
+curl http://localhost:3002/health
+curl http://localhost:5678/healthz
 ```
 
-Respuesta esperada:
+### Puertos locales
 
-```json
-{
-  "Status": "Up and Running"
+| Servicio | URL |
+| --- | --- |
+| Fleet API | `http://localhost:3000` |
+| Logistics API | `http://localhost:3001` |
+| MCP | `http://localhost:3002/mcp` |
+| n8n | `http://localhost:5678` |
+| Ollama | `http://localhost:11434` |
+| PostgreSQL | `localhost:5432` |
+
+## Configuración
+
+Los nombres exactos pueden variar ligeramente entre submódulos. Estas son las variables relevantes de la integración.
+
+### Fleet Service
+
+```env
+PORT=:3000
+DB_CONTEXT=postgresql
+DB_STRING=host=postgres user=app password=app_local_password dbname=fleet_db port=5432 sslmode=disable
+```
+
+### Logistic Service con Ollama
+
+```env
+PORT=:3001
+DB_CONTEXT=postgresql
+DB_STRING=host=postgres user=app password=app_local_password dbname=logistics_db port=5432 sslmode=disable
+FLEET_SERVICE_URL=http://fleet-service:3000
+
+EMBEDDING_PROVIDER=ollama
+OLLAMA_URL=http://ollama:11434
+OLLAMA_EMBEDDING_MODEL=nomic-embed-text-v2-moe
+EMBEDDING_DIMENSIONS=768
+```
+
+### Logistic Service con Vertex AI
+
+```env
+EMBEDDING_PROVIDER=vertex
+GCP_PROJECT_ID=my-gcp-project
+VERTEX_LOCATION=us-central1
+VERTEX_EMBEDDING_MODEL=text-multilingual-embedding-002
+EMBEDDING_DIMENSIONS=768
+```
+
+La aplicación selecciona la implementación de embeddings mediante `EMBEDDING_PROVIDER`; los handlers y DTOs no dependen del proveedor.
+
+### MCP Server
+
+```env
+PORT=:3002
+LOGISTIC_SERVICE_URL=http://logistic-service:3001
+MCP_API_KEY=entropy-local-secret
+```
+
+### n8n
+
+```env
+GENERIC_TIMEZONE=America/El_Salvador
+TZ=America/El_Salvador
+N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
+N8N_RUNNERS_ENABLED=true
+```
+
+La información de n8n se conserva en el volumen `n8n_data`.
+
+Configuración equivalente en Compose:
+
+```yaml
+services:
+  n8n:
+    image: n8nio/n8n
+    container_name: n8n
+    ports:
+      - "5678:5678"
+    environment:
+      GENERIC_TIMEZONE: America/El_Salvador
+      TZ: America/El_Salvador
+      N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS: "true"
+      N8N_RUNNERS_ENABLED: "true"
+    volumes:
+      - n8n_data:/home/node/.n8n
+
+volumes:
+  n8n_data:
+```
+
+## Modelo principal de Equipment
+
+```go
+type Equipment struct {
+    ID       uuid.UUID  `json:"id" gorm:"type:uuid;primaryKey"`
+    Code     string     `json:"code" gorm:"size:50;not null;uniqueIndex"`
+    FleetID  *uuid.UUID `json:"fleetId,omitempty" gorm:"type:uuid;index"`
+
+    Type         EquipmentType `json:"type" gorm:"size:30;not null;index"`
+    Brand        string        `json:"brand" gorm:"size:100;not null"`
+    Model        string        `json:"model" gorm:"size:100;not null"`
+    SerialNumber string        `json:"serialNumber" gorm:"size:100;not null;uniqueIndex"`
+    Year         int           `json:"year" gorm:"not null"`
+
+    CapacityTons float64         `json:"capacityTons" gorm:"type:numeric(8,2);not null"`
+    Status       EquipmentStatus `json:"status" gorm:"size:30;not null;default:AVAILABLE;index"`
+    Location     Location        `json:"location" gorm:"embedded"`
+
+    EngineHours          float64 `json:"engineHours" gorm:"type:numeric(12,2);not null;default:0"`
+    NextMaintenanceHours float64 `json:"nextMaintenanceHours" gorm:"type:numeric(12,2);not null"`
+    FuelPercent          float64 `json:"fuelPercent" gorm:"type:numeric(5,2);not null"`
+
+    CreatedAt time.Time `json:"createdAt"`
+    UpdatedAt time.Time `json:"updatedAt"`
+}
+
+type Location struct {
+    Name      string  `json:"name" gorm:"column:location_name;size:150;not null"`
+    Latitude  float64 `json:"latitude" gorm:"column:latitude;not null"`
+    Longitude float64 `json:"longitude" gorm:"column:longitude;not null"`
 }
 ```
 
----
+La relación se modela únicamente desde `Equipment.FleetID`. `Fleet` no necesita guardar un arreglo persistente de equipos; cuando se requiere, se consulta por la clave foránea.
 
-# API de Fleet Service
+## API de Fleet
 
-Base URL:
+Base URL local:
 
 ```text
 http://localhost:3000/api/v1
 ```
 
-## Endpoints de maquinaria
+### Flotas
 
-| Método | Endpoint | Descripción |
-|---|---|---|
-| `POST` | `/equipments` | Registrar maquinaria |
-| `GET` | `/equipments` | Listar y filtrar maquinaria |
-| `GET` | `/equipments/:id` | Consultar maquinaria por UUID |
-| `PATCH` | `/equipments/:id` | Actualizar datos de maquinaria |
-| `PATCH` | `/equipments/:id/status` | Cambiar estado operativo |
-| `GET` | `/equipments/:id/status-history` | Consultar historial de estados |
+| Método | Ruta | Función |
+| --- | --- | --- |
+| `POST` | `/fleets` | Crear flota. |
+| `GET` | `/fleets` | Listar flotas con paginación. |
+| `GET` | `/fleets/:fleetID` | Consultar una flota. |
+| `PATCH` | `/fleets/:fleetID` | Actualizar campos editables. |
+| `DELETE` | `/fleets/:fleetID` | Eliminar flota; responde `204`. |
+| `GET` | `/fleets/:fleetID/equipments` | Listar equipos de la flota. |
+| `PUT` | `/fleets/:fleetID/equipments/:equipmentID` | Agregar equipo a la flota. |
+| `DELETE` | `/fleets/:fleetID/equipments/:equipmentID` | Retirar equipo de la flota. |
 
-## Endpoints de flotas
+### Maquinaria
 
-| Método | Endpoint | Descripción |
-|---|---|---|
-| `POST` | `/fleets` | Crear una flota |
-| `GET` | `/fleets` | Listar flotas |
-| `GET` | `/fleets/:fleetID` | Consultar flota |
-| `PATCH` | `/fleets/:fleetID` | Actualizar flota |
-| `PUT` | `/fleets/:fleetID/equipments/:equipmentID` | Agregar maquinaria a la flota |
-| `DELETE` | `/fleets/:fleetID/equipments/:equipmentID` | Retirar maquinaria de la flota |
-| `GET` | `/fleets/:fleetID/equipments` | Listar maquinaria de la flota |
+| Método | Ruta | Función |
+| --- | --- | --- |
+| `POST` | `/equipments` | Crear maquinaria. |
+| `GET` | `/equipments` | Listar y filtrar maquinaria. |
+| `GET` | `/equipments/:equipmentID` | Consultar maquinaria. |
+| `PATCH` | `/equipments/:equipmentID` | Actualizar datos editables. |
+| `DELETE` | `/equipments/:equipmentID` | Eliminar maquinaria; responde `204`. |
+| `PATCH` | `/equipments/:equipmentID/status` | Cambiar estado con una razón. |
+| `GET` | `/equipments/:equipmentID/status-history` | Consultar historial de estados. |
 
-## Ejemplo: crear una flota
+El listado general soporta filtros, por lo que no se requiere un endpoint duplicado para equipos disponibles:
 
 ```bash
-curl -X POST http://localhost:3000/api/v1/fleets \
+curl 'http://localhost:3000/api/v1/equipments?page=1&pageSize=100&status=AVAILABLE&search=CAT'
+```
+
+### Estados de Equipment
+
+```text
+AVAILABLE · RESERVED · IN_TRANSIT · WORKING · MAINTENANCE · INACTIVE · RETIRED
+```
+
+Ejemplo de cambio de estado:
+
+```bash
+curl -X PATCH 'http://localhost:3000/api/v1/equipments/EQUIPMENT_ID/status' \
   -H 'Content-Type: application/json' \
-  -d '{
-    "code": "FLEET-SV-001",
-    "name": "Flota San Miguel"
-  }'
+  -d '{"status":"MAINTENANCE","reason":"Mantenimiento preventivo"}'
 ```
 
-Respuesta esperada:
+## API de Logistics
 
-```text
-HTTP 201 Created
-```
-
-La respuesta contiene el UUID generado para la flota.
-
-## Ejemplo: crear maquinaria
-
-```bash
-curl -X POST http://localhost:3000/api/v1/equipments \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "code": "EXC-001",
-    "type": "EXCAVATOR",
-    "brand": "Caterpillar",
-    "model": "320",
-    "serialNumber": "CAT320-0001",
-    "year": 2026,
-    "capacityTons": 23,
-    "location": {
-      "name": "San Miguel",
-      "latitude": 13.4835,
-      "longitude": -88.1828
-    },
-    "engineHours": 100,
-    "maintenanceIntervalHours": 500,
-    "fuelPercent": 95
-  }'
-```
-
-Respuesta esperada:
-
-```text
-HTTP 201 Created
-```
-
-La maquinaria inicia disponible y el servicio calcula el siguiente límite de mantenimiento a partir de las horas actuales y el intervalo configurado.
-
-Ejemplo conceptual:
-
-```text
-engineHours = 100
-maintenanceIntervalHours = 500
-nextMaintenanceHours = 600
-```
-
-## Ejemplo: asignar maquinaria a una flota
-
-```bash
-curl -X PUT \
-  http://localhost:3000/api/v1/fleets/<FLEET_ID>/equipments/<EQUIPMENT_ID>
-```
-
-Respuesta esperada:
-
-```text
-HTTP 200 OK
-```
-
-## Ejemplo: cambiar estado de maquinaria
-
-```bash
-curl -X PATCH \
-  http://localhost:3000/api/v1/equipments/<EQUIPMENT_ID>/status \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "status": "RESERVED",
-    "reason": "Reservada para solicitud logística"
-  }'
-```
-
-Respuesta esperada:
-
-```text
-HTTP 200 OK
-```
-
-Una transición que no sea válida devuelve:
-
-```text
-HTTP 422 Unprocessable Entity
-```
-
----
-
-# API de Logistic Service
-
-Base URL:
+Base URL local:
 
 ```text
 http://localhost:3001/api/v1
 ```
 
-| Método | Endpoint | Descripción |
-|---|---|---|
-| `POST` | `/requests` | Crear solicitud logística |
-| `GET` | `/requests` | Listar solicitudes |
-| `GET` | `/requests/:requestID` | Consultar solicitud |
-| `PATCH` | `/requests/:requestID` | Modificar una solicitud `PENDING` |
-| `PATCH` | `/requests/:requestID/status` | Cambiar estado |
-| `GET` | `/requests/:requestID/status-history` | Consultar historial |
-| `GET` | `/requests/:requestID/recommendations` | Generar recomendaciones de maquinaria |
+### Solicitudes
 
-## Ejemplo: crear una solicitud
+| Método | Ruta | Función |
+| --- | --- | --- |
+| `POST` | `/requests` | Crear una solicitud. |
+| `GET` | `/requests` | Listar solicitudes. |
+| `QUERY` | `/requests` | Ejecutar búsqueda literal, geográfica, semántica o híbrida. |
+| `GET` | `/requests/:requestID` | Consultar una solicitud. |
+| `PATCH` | `/requests/:requestID` | Actualizar una solicitud editable. |
+| `PATCH` | `/requests/:requestID/status` | Cambiar su estado. |
+| `GET` | `/requests/:requestID/status-history` | Consultar historial. |
+| `GET` | `/requests/:requestID/recommendations` | Calcular recomendaciones. |
+
+Ejemplo de creación:
 
 ```bash
-curl -X POST http://localhost:3001/api/v1/requests \
+curl -X POST 'http://localhost:3001/api/v1/requests' \
   -H 'Content-Type: application/json' \
   -d '{
     "equipmentType": "EXCAVATOR",
-    "projectName": "Proyecto San Miguel",
+    "projectName": "Proyecto Escalón Galerías",
     "location": {
-      "name": "San Miguel",
-      "latitude": 13.4833,
-      "longitude": -88.1833
+      "name": "P.º Gral. Escalón 3700, San Salvador, El Salvador",
+      "latitude": 13.7022056,
+      "longitude": -89.2299316
     },
+    "description": "Excavación y preparación de terreno comercial",
+    "requirements": "Capacidad mínima de veinte toneladas",
     "startDate": "2030-09-10T08:00:00Z",
-    "endDate": "2030-09-15T18:00:00Z"
+    "endDate": "2030-09-15T17:00:00Z"
   }'
 ```
 
-Respuesta esperada:
+`location.name` es obligatorio. Las coordenadas pueden provenir del frontend o de la herramienta de Google Maps configurada en n8n.
+
+### Estados de Request
 
 ```text
-HTTP 201 Created
+PENDING · ASSIGNED · COMPLETED · CANCELLED
 ```
 
-La solicitud inicia en:
+Una solicitud `ASSIGNED`, `COMPLETED` o `CANCELLED` no puede editarse como si continuara pendiente. Las operaciones inválidas se rechazan con `409 Conflict` o `422 Unprocessable Entity`, según el tipo de conflicto.
 
-```json
-{
-  "status": "PENDING"
-}
-```
+### Asignaciones
 
-## Ejemplo: solicitar recomendaciones
+| Método | Ruta | Función |
+| --- | --- | --- |
+| `POST` | `/requests/:requestID/assignment` | Crear una asignación. |
+| `GET` | `/requests/:requestID/assignment` | Consultar la asignación de una solicitud. |
+| `GET` | `/assignments` | Listar asignaciones; admite `status`, `page` y `pageSize`. |
+| `GET` | `/assignments/:assignmentID` | Consultar una asignación. |
+| `PATCH` | `/assignments/:assignmentID/status` | Completar o cancelar. |
 
-```bash
-curl \
-  http://localhost:3001/api/v1/requests/<REQUEST_ID>/recommendations
-```
-
-Ejemplo de respuesta:
-
-```json
-{
-  "data": {
-    "requestId": "<REQUEST_ID>",
-    "count": 1,
-    "recommendations": [
-      {
-        "equipmentId": "<EQUIPMENT_ID>",
-        "code": "EXC-001",
-        "type": "EXCAVATOR",
-        "brand": "Caterpillar",
-        "model": "320",
-        "distanceKm": 0.06,
-        "engineHours": 100,
-        "nextMaintenanceHours": 600,
-        "maintenanceHoursRemaining": 500,
-        "fuelPercent": 95,
-        "score": 99.23,
-        "reasons": [
-          "Maquinaria disponible",
-          "Se encuentra a 0.06 km del proyecto",
-          "Tiene 500.00 horas antes del próximo mantenimiento",
-          "Nivel de combustible de 95.00%"
-        ]
-      }
-    ]
-  }
-}
-```
-
-Si no existen candidatos válidos, la petición sigue siendo exitosa:
-
-```json
-{
-  "data": {
-    "requestId": "<REQUEST_ID>",
-    "count": 0,
-    "recommendations": []
-  }
-}
-```
-
-Si la solicitud ya no está `PENDING`:
+Estados de Assignment:
 
 ```text
-HTTP 409 Conflict
+ACTIVE · COMPLETED · CANCELLED
 ```
+
+## Búsqueda literal, geográfica y vectorial
+
+La búsqueda se expone con el método `QUERY` para aceptar un cuerpo JSON sin confundirla con la creación de recursos.
+
+> Nota de compatibilidad: `QUERY` no es tan universal como `GET` o `POST`. Antes de desplegar, se debe comprobar que el load balancer, WAF, cliente HTTP y gateway utilizados permitan este método.
+
+### Campos admitidos
+
+```json
+{
+  "query": "Galerías",
+  "semanticQuery": "preparar terreno para construir una zona comercial",
+  "statuses": ["PENDING"],
+  "equipmentType": "EXCAVATOR",
+  "near": {
+    "latitude": 13.7022056,
+    "longitude": -89.2299316,
+    "radiusKm": 25
+  },
+  "minSemanticScore": 0.45,
+  "page": 1,
+  "pageSize": 20
+}
+```
+
+| Campo | Comportamiento |
+| --- | --- |
+| `query` | Coincidencia literal con `ILIKE` sobre proyecto, ubicación y tipo. |
+| `semanticQuery` | Similitud coseno entre embeddings. |
+| `near` | Distancia Haversine y filtro opcional por radio. |
+| `statuses` | Restringe los estados aceptados. |
+| `equipmentType` | Restringe el tipo de maquinaria. |
+| `minSemanticScore` | Umbral entre `0` y `1`; requiere `semanticQuery`. |
+| `page`, `pageSize` | Paginación del resultado. |
 
 Ejemplo:
 
-```json
-{
-  "error": "request_not_pending",
-  "message": "Solo se pueden generar recomendaciones para peticiones con estado PENDING"
-}
+```bash
+curl -X QUERY 'http://localhost:3001/api/v1/requests' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "semanticQuery": "equipo para levantar piezas metálicas pesadas",
+    "statuses": ["PENDING"],
+    "near": {"latitude": 13.7, "longitude": -89.22, "radiusKm": 50},
+    "page": 1,
+    "pageSize": 10
+  }'
 ```
 
-Si Logistics no puede consultar Fleet:
+### Persistencia de embeddings
 
-```text
-HTTP 502 Bad Gateway
-```
+Los vectores viven en una tabla separada, por ejemplo `logistics_request_embeddings`, relacionada con la solicitud mediante `request_id`. El registro contiene:
 
-```json
-{
-  "error": "fleet_service_unavailable",
-  "message": "No se pudo consultar la maquinaria disponible"
-}
-```
+- proveedor y modelo;
+- texto normalizado utilizado para el embedding;
+- vector de 768 dimensiones;
+- fecha de actualización.
 
----
+Se utiliza un índice HNSW con distancia coseno para evitar búsquedas secuenciales a medida que crece el volumen.
 
-# Estados y flujos
+Los documentos y consultas usan el formato recomendado por el proveedor. Para Ollama se diferencian los prefijos de documento y consulta.
 
-## Estados de maquinaria
+### Regla importante al cambiar de proveedor
 
-| Estado | Descripción |
-|---|---|
-| `AVAILABLE` | Disponible para ser recomendada o reservada |
-| `RESERVED` | Reservada para un trabajo |
-| `IN_TRANSIT` | En traslado al proyecto |
-| `WORKING` | Ejecutando el trabajo |
-| `MAINTENANCE` | En mantenimiento |
-| `INACTIVE` | Temporalmente inactiva |
-| `RETIRED` | Retirada definitivamente |
+No se deben comparar embeddings creados por modelos diferentes. Las consultas filtran `provider` y `model`; al cambiar Ollama por Vertex en una misma base se deben regenerar los embeddings existentes.
 
-## Transiciones permitidas de maquinaria
+En la práctica se recomienda:
 
-| Estado actual | Siguientes estados permitidos |
-|---|---|
-| `AVAILABLE` | `RESERVED`, `MAINTENANCE`, `INACTIVE` |
-| `RESERVED` | `AVAILABLE`, `IN_TRANSIT`, `WORKING`, `MAINTENANCE` |
-| `IN_TRANSIT` | `AVAILABLE`, `WORKING`, `MAINTENANCE` |
-| `WORKING` | `AVAILABLE`, `MAINTENANCE` |
-| `MAINTENANCE` | `AVAILABLE`, `INACTIVE` |
-| `INACTIVE` | `AVAILABLE`, `RETIRED` |
-| `RETIRED` | Ninguno |
+- desarrollo local: Ollama;
+- DEV/PROD en GCP: Vertex AI;
+- una base independiente por ambiente;
+- un proceso explícito de reindexación si cambia el modelo.
 
-Flujo operacional común:
+## Algoritmo de recomendaciones
 
-```text
-AVAILABLE
-   │
-   ▼
-RESERVED
-   │
-   ▼
-IN_TRANSIT
-   │
-   ▼
-WORKING
-   │
-   ▼
-AVAILABLE
-```
+Las recomendaciones no las decide Gemini. `logistic-service` consulta Fleet y aplica reglas deterministas:
 
-## Estados de solicitudes logísticas
+1. La solicitud debe estar en `PENDING`.
+2. El equipo debe tener el mismo `equipmentType`.
+3. El equipo debe estar `AVAILABLE`.
+4. Debe tener margen positivo antes del siguiente mantenimiento.
+5. Cada candidato recibe un score de `0` a `100`.
+6. Los candidatos se ordenan de mayor a menor score.
 
-| Estado | Descripción |
-|---|---|
-| `PENDING` | Pendiente de selección/asignación de maquinaria |
-| `ASSIGNED` | Solicitud confirmada |
-| `COMPLETED` | Operación completada |
-| `CANCELLED` | Solicitud cancelada |
+Ponderación actual:
 
-Transiciones:
-
-```text
-PENDING ─────────> ASSIGNED ─────────> COMPLETED
-   │                  │
-   │                  └──────────────> CANCELLED
-   │
-   └─────────────────────────────────> CANCELLED
-```
-
-Una solicitud `COMPLETED` o `CANCELLED` se considera terminal.
-
----
-
-# Motor de recomendaciones
-
-`logistic-service` consulta a `fleet-service` en tiempo real para determinar qué maquinaria es elegible para una solicitud.
-
-## Elegibilidad
-
-Un equipo participa en el ranking cuando cumple:
-
-```text
-status == AVAILABLE
-AND type == request.equipmentType
-AND nextMaintenanceHours - engineHours > 0
-```
-
-Por esto, reservar un equipo en Fleet hace que deje de aparecer en una siguiente consulta de recomendaciones.
-
-## Factores evaluados
-
-El score máximo es de `100` puntos:
-
-| Factor | Peso |
-|---|---:|
-| Cercanía al proyecto | 60 |
-| Margen antes del mantenimiento | 25 |
-| Nivel de combustible | 15 |
-| **Total** | **100** |
-
-## Distancia
-
-La distancia se calcula mediante la fórmula de **Haversine**, usando la latitud y longitud del proyecto y de cada maquinaria.
-
-La distancia representa una aproximación geográfica en línea recta y no una ruta vial.
-
-## Fórmula del score
-
-```text
-distanceFactor    = 1 - clamp(distanceKm / 200, 0, 1)
-maintenanceFactor = clamp(maintenanceHoursRemaining / 500, 0, 1)
-fuelFactor        = clamp(fuelPercent / 100, 0, 1)
-
-score = distanceFactor * 60
-      + maintenanceFactor * 25
-      + fuelFactor * 15
-```
-
-Donde:
-
-```text
-maintenanceHoursRemaining = nextMaintenanceHours - engineHours
-```
-
-El mayor score representa la recomendación más favorable bajo los criterios actuales.
-
----
-
-# Caso de uso integrado
-
-El flujo principal de la plataforma puede representarse así:
+| Factor | Peso máximo | Objetivo |
+| --- | ---: | --- |
+| Cercanía | 60 puntos | Reducir tiempo y costo de traslado. |
+| Mantenimiento | 25 puntos | Evitar asignar equipos próximos al servicio. |
+| Combustible | 15 puntos | Favorecer equipos con mejor autonomía inicial. |
 
 ```mermaid
-sequenceDiagram
-    participant U as Cliente
-    participant L as Logistic Service
-    participant F as Fleet Service
-    participant DBL as logistics_db
-    participant DBF as fleet_db
-
-    U->>F: Crear flota
-    F->>DBF: Persistir flota
-
-    U->>F: Registrar maquinaria
-    F->>DBF: Persistir maquinaria AVAILABLE
-
-    U->>F: Agregar maquinaria a flota
-    F->>DBF: Actualizar fleetId
-
-    U->>L: Crear solicitud logística
-    L->>DBL: Guardar solicitud PENDING
-
-    U->>L: GET recommendations
-    L->>F: Consultar maquinaria disponible
-    F->>DBF: Buscar equipos AVAILABLE
-    F-->>L: Equipos candidatos
-    L-->>U: Ranking por score
-
-    U->>F: RESERVED
-    F->>DBF: Registrar transición
-
-    U->>L: ASSIGNED
-    L->>DBL: Registrar transición
-
-    U->>F: IN_TRANSIT -> WORKING
-    F->>DBF: Registrar transiciones
-
-    U->>L: COMPLETED
-    L->>DBL: Registrar transición
-
-    U->>F: AVAILABLE
-    F->>DBF: Liberar maquinaria
+flowchart TD
+    R["Request PENDING"] --> C["Equipos compatibles y AVAILABLE"]
+    C --> S["Score: distancia + mantenimiento + combustible"]
+    S --> O["Ranking descendente"]
+    O --> A["Selección y Assignment"]
 ```
 
-### Ejemplo funcional
+Una lista vacía no representa un fallo: indica que no existe maquinaria que cumpla todas las condiciones actuales.
 
-1. Se crea una flota.
-2. Se registran dos excavadoras.
-3. Ambas se agregan a la flota.
-4. Se crea una solicitud `PENDING` para una excavadora en San Miguel.
-5. Logistics consulta Fleet.
-6. El motor calcula el score de cada excavadora.
-7. La excavadora más cercana y con mejores condiciones obtiene un score mayor.
-8. El equipo seleccionado cambia de `AVAILABLE` a `RESERVED`.
-9. Al volver a consultar recomendaciones, el equipo reservado ya no aparece.
-10. La solicitud cambia de `PENDING` a `ASSIGNED`.
-11. La maquinaria pasa a `IN_TRANSIT` y posteriormente a `WORKING`.
-12. La solicitud finaliza en `COMPLETED`.
-13. La maquinaria vuelve a `AVAILABLE`.
-14. Se consultan los historiales para validar el ciclo completo.
+## Ciclo de asignaciones
 
----
+```mermaid
+stateDiagram-v2
+    [*] --> ACTIVE: crear assignment
+    ACTIVE --> COMPLETED: trabajo finalizado
+    ACTIVE --> CANCELLED: operación cancelada
+    COMPLETED --> [*]
+    CANCELLED --> [*]
+```
 
-# Prueba end-to-end
+### Creación
 
-El repositorio padre incluye:
+Al crear un Assignment:
+
+- se valida que el request exista y esté `PENDING`;
+- se valida que el equipo exista y esté `AVAILABLE`;
+- se crea la asignación `ACTIVE`;
+- el request cambia a `ASSIGNED`;
+- Fleet cambia el equipo a `RESERVED`.
+
+### Finalización
+
+Al completar:
+
+- Assignment cambia a `COMPLETED`;
+- Request cambia a `COMPLETED`;
+- Equipment vuelve a `AVAILABLE`.
+
+### Cancelación
+
+Al cancelar:
+
+- Assignment cambia a `CANCELLED`;
+- Request cambia a `CANCELLED`;
+- Equipment vuelve a `AVAILABLE`.
+
+Los estados terminales no pueden cambiar nuevamente. Para el MVP, Logistics coordina las llamadas HTTP a Fleet; la evolución a eventos con Pub/Sub se plantea cuando sea necesario desacoplar procesos asincrónicos y reconciliar fallos.
+
+## MCP Server
+
+Endpoint local:
 
 ```text
-fleet-logistic-e2e-test.sh
+http://localhost:3002/mcp
 ```
 
-Este script valida la integración real entre los dos microservicios.
+La conexión utiliza transporte **Streamable HTTP** y autenticación Bearer:
 
-## Requisitos
+```http
+Authorization: Bearer entropy-local-secret
+```
+
+### Herramientas disponibles
+
+| Tool | Función | Confirmación |
+| --- | --- | --- |
+| `create_logistics_request` | Crear una solicitud con ubicación, fechas, descripción y requisitos. | Conversacional en n8n. |
+| `get_logistics_request` | Consultar una solicitud por ID. | No. |
+| `search_logistics_requests` | Buscar por texto, semántica, estado, tipo y proximidad. | No. |
+| `get_recommendations` | Obtener el ranking de maquinaria. | No. |
+| `create_assignment` | Asignar un equipo a una solicitud. | `confirmed=true`. |
+| `get_assignment` | Consultar la asignación asociada a una solicitud. | No. |
+| `complete_assignment` | Completar y liberar el equipo. | `confirmed=true`. |
+| `cancel_assignment` | Cancelar y liberar el equipo. | `confirmed=true`. |
+
+### Compatibilidad del schema con Gemini
+
+Los esquemas de entrada de las tools se declaran con un subconjunto simple de JSON Schema. Esto evita errores `400 Invalid JSON payload` del adaptador de Google Generative AI.
+
+No se deben incluir en los parámetros publicados a Gemini construcciones como:
+
+- tipos union generados como `type: ["null", "number"]`;
+- `exclusiveMinimum`;
+- restricciones avanzadas que el adaptador no reconozca.
+
+Las validaciones estrictas siguen ejecutándose dentro de MCP y de `logistic-service`; simplificar el schema anunciado no elimina las reglas de negocio.
+
+### Prueba manual de MCP
+
+Inicializar una sesión y listar herramientas:
+
+```bash
+curl -X POST 'http://localhost:3002/mcp' \
+  -H 'Authorization: Bearer entropy-local-secret' \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{
+    "jsonrpc":"2.0",
+    "id":"init-1",
+    "method":"initialize",
+    "params":{
+      "protocolVersion":"2026-07-28",
+      "capabilities":{},
+      "clientInfo":{"name":"manual-test","version":"1.0.0"}
+    }
+  }'
+```
+
+Para pruebas completas se recomienda la suite E2E, porque administra automáticamente el identificador de sesión y los headers del protocolo.
+
+## Flujo de n8n
+
+### Nodos recomendados
+
+1. **Chat Trigger** recibe el mensaje.
+2. **AI Agent** interpreta la intención y mantiene el contexto conversacional.
+3. **Google Gemini Chat Model** genera la respuesta y decide qué tool solicitar.
+4. **MCP Client Tool** expone las herramientas de Entropy al agente.
+5. **Google Maps** geocodifica ubicaciones cuando el usuario no proporciona coordenadas.
+6. **Chat Response** devuelve el resultado final.
+
+### Configuración del MCP Client Tool
+
+| Campo | Valor local |
+| --- | --- |
+| Endpoint | `http://entropy-mcp-server:3002/mcp` |
+| Server Transport | `HTTP Streamable` |
+| Authentication | Header/Bearer con `MCP_API_KEY` |
+| Tools to Include | Todas durante la demo; limitar por rol en producción. |
+
+El nombre `entropy-mcp-server` funciona entre contenedores de la misma red de Compose. Desde el host se utiliza `localhost:3002`.
+
+### Chat Trigger
+
+Cuando se utiliza un nodo explícito para responder, **Response Mode** debe configurarse como:
 
 ```text
-curl
-jq
-fleet-service en ejecución
-logistic-service en ejecución
+Using Response Nodes
 ```
 
-## Ejecutar
+### Reglas del agente
+
+- Solicitar los datos que falten antes de crear una petición.
+- Usar Google Maps para resolver una ubicación; nunca inventar coordenadas.
+- Usar `query` para coincidencias textuales y `semanticQuery` para conceptos.
+- Usar `near` solamente con coordenadas verificadas.
+- No enviar `minSemanticScore` en la primera búsqueda salvo que exista una razón concreta.
+- Evitar combinar `query` y `semanticQuery` innecesariamente.
+- Mostrar nombres y datos útiles al usuario; ocultar UUID salvo que sean necesarios.
+- Pedir confirmación clara antes de asignar, completar o cancelar.
+- No intentar consultar PostgreSQL directamente.
+
+n8n no genera los embeddings: envía `semanticQuery` a MCP y `logistic-service` usa el proveedor configurado.
+
+## Pruebas E2E
+
+La suite integrada valida Fleet, Logistics, MCP, Ollama y las reglas entre servicios.
+
+### Ejecutar
 
 ```bash
 chmod +x fleet-logistic-e2e-test.sh
+
+EMBEDDING_PROVIDER_EXPECTED=ollama \
+OLLAMA_BASE_URL=http://localhost:11434 \
+OLLAMA_EMBEDDING_MODEL=nomic-embed-text-v2-moe \
 ./fleet-logistic-e2e-test.sh
 ```
 
-Por defecto utiliza:
+Variables opcionales:
 
-```text
-FLEET_BASE_URL=http://localhost:3000/api/v1
-LOGISTIC_BASE_URL=http://localhost:3001/api/v1
+```env
+FLEET_BASE_URL=http://localhost:3000
+LOGISTIC_BASE_URL=http://localhost:3001
+MCP_BASE_URL=http://localhost:3002
+MCP_API_KEY=entropy-local-secret
+MCP_PROTOCOL_VERSION=2026-07-28
 ```
 
-También se pueden sobrescribir:
+### Cobertura del flujo
 
-```bash
-FLEET_BASE_URL=http://localhost:3000/api/v1 \
-LOGISTIC_BASE_URL=http://localhost:3001/api/v1 \
-./fleet-logistic-e2e-test.sh
-```
+La prueba:
 
-## Qué valida
+1. comprueba la salud de los tres servicios;
+2. valida autenticación, descubrimiento y catálogo MCP;
+3. crea una flota y dos equipos con distancias diferentes;
+4. incorpora ambos equipos a la flota;
+5. crea solicitudes con descripción y requisitos;
+6. valida búsquedas semánticas en escenarios de excavación y elevación;
+7. valida filtros híbridos, distancia y ranking semántico relativo;
+8. rechaza scores inválidos y búsquedas incompletas;
+9. calcula recomendaciones y comprueba que el equipo cercano obtenga mayor score;
+10. verifica que una mutación MCP sin confirmación no cambie datos;
+11. crea una asignación confirmada;
+12. comprueba `Request=ASSIGNED` y `Equipment=RESERVED`;
+13. evita recomendaciones y asignaciones duplicadas;
+14. cancela una asignación y libera el equipo;
+15. completa otra asignación y libera el equipo;
+16. valida conflictos, recursos inexistentes e historial;
+17. limpia los datos creados.
 
-La prueba integrada:
-
-1. comprueba que ambos servicios respondan;
-2. crea una flota;
-3. crea una excavadora cercana;
-4. crea una excavadora más distante;
-5. agrega ambas a la flota;
-6. crea una solicitud logística `PENDING`;
-7. obtiene recomendaciones;
-8. comprueba que ambas máquinas sean candidatas;
-9. comprueba que la máquina cercana tenga mayor score;
-10. reserva la mejor recomendación;
-11. comprueba que la máquina `RESERVED` ya no aparezca;
-12. cambia la solicitud a `ASSIGNED`;
-13. comprueba que una solicitud asignada ya no genere recomendaciones;
-14. pasa la maquinaria por `IN_TRANSIT` y `WORKING`;
-15. completa la solicitud;
-16. libera la maquinaria a `AVAILABLE`;
-17. comprueba los estados finales;
-18. valida los historiales de ambos servicios;
-19. retira las máquinas de la flota.
-
-Al finalizar correctamente se muestra:
+Resultado esperado:
 
 ```text
 Todas las pruebas integradas finalizaron correctamente.
 ```
 
-Además imprime los UUID creados durante la ejecución.
+## Datos para la demo
 
----
-
-# Comandos útiles
-
-## Construir todo
+El script `seed-demo-data.sh` crea un conjunto coherente de flotas, maquinaria y solicitudes para evitar que la demo dependa del orden de pruebas.
 
 ```bash
-docker compose build
+chmod +x seed-demo-data.sh
+./seed-demo-data.sh
 ```
 
-## Levantar todo
+Antes de una presentación conviene comprobar:
 
 ```bash
-docker compose up -d
+curl 'http://localhost:3000/api/v1/equipments?page=1&pageSize=100&status=AVAILABLE' | jq
+curl 'http://localhost:3001/api/v1/requests?page=1&pageSize=100' | jq
 ```
 
-## Reconstruir después de modificar código
+Si no existen equipos `AVAILABLE`, las recomendaciones estarán vacías por diseño. Completar o cancelar una asignación activa libera su equipo.
+
+## Observabilidad
+
+Los servicios incluyen logging estructurado y soporte para OpenTelemetry.
+
+En local se recomienda mantener la instrumentación activa sin usar el exporter `stdout`, porque imprime cada span y llena los logs. Las opciones adecuadas son:
+
+- exporter deshabilitado en local;
+- OTLP hacia un collector local si se necesita inspección;
+- OTLP o el backend definido para GCP en ambientes cloud.
+
+La selección debe realizarse mediante variables de ambiente, sin retirar los spans del código. De esta forma el mismo binario conserva la instrumentación en todos los ambientes.
+
+Comandos útiles:
 
 ```bash
-docker compose up -d --build
-```
-
-## Reiniciar un solo servicio
-
-```bash
-docker compose restart fleet-service
-```
-
-```bash
-docker compose restart logistic-service
-```
-
-## Reconstruir solamente Fleet
-
-```bash
-docker compose up -d --build fleet-service
-```
-
-## Reconstruir solamente Logistics
-
-```bash
-docker compose up -d --build logistic-service
-```
-
-## Ver logs
-
-```bash
-docker compose logs -f fleet-service logistic-service
-```
-
-## Ver estado
-
-```bash
+docker compose logs -f fleet-service logistic-service entropy-mcp-server n8n
 docker compose ps
 ```
 
-## Ver procesos de Docker
+## Arquitectura objetivo en GCP
 
-```bash
-docker ps
+La arquitectura local no implica que todos los componentes deban publicarse en Internet.
+
+```mermaid
+flowchart TD
+    LB["HTTPS Load Balancer"] --> FE["Next.js · Cloud Run"]
+    FE --> N8N["n8n privado · VM"]
+    N8N --> MCP["MCP privado en GKE"]
+    FE --> LS["Logistic Service · Cloud Run"]
+    LS --> FS["Fleet Service · Cloud Run"]
+    FE --> FS["Fleet Service · Cloud Run"]
+    LS --> MCP["Entropy MCP Server · Cloud Run"]
+    LS --> SQL[("Cloud SQL PostgreSQL + pgvector")]
+    FS --> SQL[("Cloud SQL PostgreSQL + pgvector")]
+    LS --> V["Vertex AI"]
+
 ```
 
-## Reinicializar las bases locales
+Propuesta de despliegue:
+
+- Frontend Next.js, `fleet-service`, `logistic-service` y MCP en Cloud Run.
+- PostgreSQL administrado en Cloud SQL para el MVP cloud.
+- Vertex AI como proveedor de embeddings.
+- n8n en una VM sin IP pública, con disco persistente.
+- DNS privado para nombres internos.
+- Conectividad desde Cloud Run hacia la VPC mediante Direct VPC egress o un conector compatible con el diseño de red.
+- Secret Manager para contraseñas, tokens y API keys.
+- HTTPS Load Balancer como entrada pública controlada.
+
+No se recomienda exponer directamente n8n, PostgreSQL ni MCP. El acceso debe limitarse por red, identidad y autenticación de aplicación.
+
+## Desarrollo con submódulos
+
+### Actualizar todo
 
 ```bash
+git submodule sync --recursive
+git submodule update --init --recursive
+git pull --recurse-submodules
+```
+
+### Trabajar en un servicio
+
+Ejemplo con Logistics:
+
+```bash
+cd logistic-service
+git switch develop
+git pull
+
+# realizar cambios y pruebas
+git add .
+git commit -m 'feat: describe el cambio'
+git push
+```
+
+Luego se registra el nuevo puntero en el repositorio padre:
+
+```bash
+cd ..
+git add logistic-service
+git commit -m 'chore: update logistic-service submodule'
+git push
+```
+
+El mismo proceso aplica a `fleet-service` y `entropy-mcp-server`.
+
+### Si aparece una versión antigua
+
+```bash
+git submodule update --init --recursive --remote
+git -C logistic-service status
+git status
+```
+
+Antes de usar `--remote`, confirmar que `.gitmodules` defina la rama esperada. El repositorio padre siempre reproduce el commit fijado, no necesariamente el último commit visible en GitHub.
+
+## Comandos útiles
+
+```bash
+# Construir y levantar
+docker compose up -d --build
+
+# Reconstruir un servicio
+docker compose up -d --build logistic-service
+
+# Reiniciar
+docker compose restart fleet-service
+
+# Ver estado
+docker compose ps
+
+# Detener sin borrar datos
+docker compose down
+
+# Reinicializar todo, incluidos PostgreSQL, Ollama y n8n
 docker compose down -v
 docker compose up -d --build
 ```
 
----
+> `docker compose down -v` elimina los volúmenes locales. Se perderán bases, credenciales/configuración de n8n y modelos descargados de Ollama.
 
-# Observabilidad
+## Solución de problemas
 
-Ambos servicios cuentan con soporte para OpenTelemetry.
+### Logistics devuelve `502 fleet_service_unavailable`
 
-En el Compose integrado se utiliza:
-
-```env
-TRACE_TYPE=NONE
-```
-
-para mantener simple el entorno local.
-
-Los servicios soportan configuraciones de tracing como:
-
-```text
-STDOUT
-OTLP
-GCP
-NONE
-DISABLED
-```
-
-En ambientes con un collector OpenTelemetry se puede configurar un endpoint OTLP mediante las variables propias de cada microservicio.
-
-Para detalles de logging, tracing y configuración de Google Cloud consultar los `README.md` dentro de cada submódulo.
-
----
-
-# Desarrollo de los submódulos
-
-## ¿Dónde modificar Fleet?
-
-Trabajar directamente dentro de:
-
-```bash
-cd fleet-service
-```
-
-Los commits de Fleet deben realizarse en el repositorio de Fleet:
-
-```bash
-git status
-git add .
-git commit -m "feat: ..."
-git push
-```
-
-Después, desde `entropy-platform`, registrar el nuevo commit del submódulo:
-
-```bash
-cd ..
-git add fleet-service
-git commit -m "chore: update fleet-service"
-git push
-```
-
-## ¿Dónde modificar Logistics?
-
-El mismo flujo aplica a:
-
-```bash
-cd logistic-service
-```
-
-Primero se hace commit y push en `logistic-service`; después se actualiza el puntero del submódulo en `entropy-platform`.
-
-## ¿Qué debe vivir en el repositorio padre?
-
-Archivos relacionados con la integración de ambos servicios, por ejemplo:
-
-```text
-compose.yaml
-postgres/init.sql
-fleet-logistic-e2e-test.sh
-README.md
-```
-
-## ¿Qué debe vivir en cada microservicio?
-
-Código y configuración específica del servicio:
-
-```text
-cmd/
-internal/
-go.mod
-go.sum
-Dockerfile
-README.md
-pruebas propias del servicio
-```
-
-Esto mantiene los repositorios desacoplados, pero permite probar una versión compatible de ambos desde `entropy-platform`.
-
----
-
-# Solución de problemas
-
-## `logistic-service` devuelve `502 fleet_service_unavailable`
-
-Ejemplo:
-
-```json
-{
-  "error": "fleet_service_unavailable",
-  "message": "No se pudo consultar la maquinaria disponible"
-}
-```
-
-Comprobar primero Fleet:
+Comprobar:
 
 ```bash
 curl http://localhost:3000/health
-```
-
-Luego revisar logs:
-
-```bash
 docker compose logs fleet-service logistic-service
 ```
 
-Dentro de Compose, `FLEET_SERVICE_URL` debe apuntar a:
+Dentro de Compose, la URL correcta es:
 
 ```text
 http://fleet-service:3000
 ```
 
-No a `localhost:3000`.
+No debe usarse `localhost`, porque dentro del contenedor apuntaría al propio Logistics.
 
----
+### Fleet responde `404 page not found` desde Logistics
 
-## Logistics devuelve recomendaciones vacías
+Comprobar que `FLEET_SERVICE_URL` no incluya un prefijo `/api/v1` duplicado y que la ruta construida por el cliente coincida con la ruta real de Fleet.
 
-Comprobar que exista maquinaria que cumpla simultáneamente:
+### Recomendaciones vacías
+
+Verificar que exista al menos un equipo que cumpla simultáneamente:
 
 ```text
 status = AVAILABLE
-mismo equipmentType de la solicitud
-horas restantes antes de mantenimiento > 0
+type = equipmentType solicitado
+nextMaintenanceHours - engineHours > 0
 ```
 
-Consultar Fleet:
+### El listado de assignments devuelve `data: null` aunque `total > 0`
 
-```bash
-curl 'http://localhost:3000/api/v1/equipments?page=1&pageSize=100'
+Después de construir la consulta de GORM, se debe ejecutarla:
+
+```go
+result := query.
+    Order("created_at DESC").
+    Limit(pageSize).
+    Offset(offset).
+    Find(&assignments)
 ```
 
----
+Omitir `Find(&assignments)` deja el slice sin cargar.
 
-## Un equipo reservado no aparece en recomendaciones
+### Error `missing FROM-clause entry for table requests`
 
-Es el comportamiento esperado.
+La tabla real es `logistics_requests`. No se deben seleccionar columnas con el alias `requests` si el `FROM` no declaró dicho alias. Usar columnas sin prefijo o declarar explícitamente:
 
-El motor solamente considera maquinaria:
-
-```text
-AVAILABLE
+```sql
+FROM logistics_requests AS requests
 ```
 
-Por lo tanto, un equipo en `RESERVED`, `IN_TRANSIT`, `WORKING`, `MAINTENANCE`, `INACTIVE` o `RETIRED` queda fuera del ranking.
+### Error de validación de `Location.Name`
 
----
+El cuerpo debe enviar el objeto anidado completo:
 
-## La base no contiene las tablas esperadas
-
-Comprobar que PostgreSQL esté saludable:
-
-```bash
-docker compose ps
+```json
+{
+  "location": {
+    "name": "San Miguel",
+    "latitude": 13.4833,
+    "longitude": -88.1833
+  }
+}
 ```
 
-Revisar logs:
+### Gemini rechaza una tool con `exclusiveMinimum` o `type` como lista
 
-```bash
-docker compose logs postgres
-```
+Revisar los schemas publicados por MCP. Deben usar el subconjunto simple descrito en [Compatibilidad del schema con Gemini](#compatibilidad-del-schema-con-gemini). Después de cambiarlo, reconstruir MCP y refrescar las tools en n8n.
 
-Los servicios ejecutan sus migraciones de aplicación al iniciar, mientras `postgres/init.sql` se encarga únicamente de crear las dos bases de datos.
-
-Si se necesita una reinicialización completa del entorno local:
-
-```bash
-docker compose down -v
-docker compose up -d --build
-```
-
----
-
-## Los submódulos aparecen vacíos
-
-Ejecutar:
-
-```bash
-git submodule update --init --recursive
-```
-
----
-
-## El repositorio padre muestra cambios aunque no se editó ningún archivo suyo
-
-Puede significar que uno de los submódulos está apuntando a otro commit.
+### No hay resultados semánticos
 
 Comprobar:
 
 ```bash
-git status
-git submodule status
+curl http://localhost:11434/api/tags | jq
+docker compose logs logistic-service ollama
 ```
 
-Si el cambio es intencional, registrar el nuevo puntero con `git add <submodule>` y hacer commit en `entropy-platform`.
+También verificar que:
 
----
+- el modelo configurado esté descargado;
+- el vector tenga 768 dimensiones;
+- existan embeddings para el mismo `provider` y `model` usados en la consulta;
+- las solicitudes antiguas hayan sido reindexadas.
 
-# Documentación de cada servicio
+### PostgreSQL no reconoce el tipo `vector`
 
-Para detalles específicos de DTOs, validaciones, respuestas de error y notas de implementación consultar:
+El contenedor debe usar una imagen con `pgvector`, por ejemplo `pgvector/pgvector:pg17`, y la base debe habilitar:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+```
+
+### El submódulo Logistics no existe o apunta a un worktree inválido
+
+Primero comprobar que no haya cambios locales sin commit:
+
+```bash
+git -C logistic-service status
+```
+
+Si el directorio no existe o la metadata quedó inconsistente, desinicializarlo y guardar una copia de la metadata antes de recrearlo:
+
+```bash
+git submodule deinit -f -- logistic-service
+mv .git/modules/logistic-service .git/modules/logistic-service.backup
+git submodule sync --recursive
+git submodule update --init --recursive logistic-service
+```
+
+Cuando el submódulo vuelva a funcionar y se haya verificado que la copia no contiene trabajo pendiente, la carpeta `.git/modules/logistic-service.backup` puede retirarse manualmente.
+
+## Seguridad
+
+- No guardar API keys ni contraseñas reales en Git.
+- Restringir la API key de Google Maps a las APIs necesarias y, cuando aplique, a las IPs o identidades del backend que la utiliza.
+- No ejecutar herramientas MCP de mutación sin confirmación.
+- Aplicar autorización por rol antes de habilitar operaciones administrativas en producción.
+- Mantener MCP, n8n y las bases en red privada.
+- Utilizar cuentas de servicio con permisos mínimos en GCP.
+- Registrar quién realizó cada cambio de estado o asignación cuando se incorpore autenticación de usuarios.
+
+## Limitaciones del MVP
+
+- La coordinación Fleet–Logistics usa llamadas HTTP síncronas y todavía no implementa saga, outbox ni reconciliación automática.
+- No existe autenticación completa de usuarios y RBAC de extremo a extremo.
+- No hay telemetría IoT real; los datos de uso y combustible son administrados o simulados.
+- El cálculo de distancia es geográfico; aún no considera rutas, tráfico, peajes ni capacidad real del transporte.
+- El frontend Next.js continúa pendiente.
+- n8n complementa el producto, pero no debe convertirse en la fuente de verdad operativa.
+- Las búsquedas vectoriales requieren reindexación cuando cambia el modelo.
+- `QUERY` debe verificarse con la infraestructura de red elegida.
+
+## Documentación por servicio
+
+Para DTOs, validaciones, modelos internos y decisiones específicas consultar también:
 
 ```text
 fleet-service/README.md
 logistic-service/README.md
+entropy-mcp-server/README.md
 ```
 
-Este README documenta principalmente la **integración entre ambos servicios y la ejecución de la plataforma completa**.
+Este documento describe la integración completa y el estado funcional del MVP.
